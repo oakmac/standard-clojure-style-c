@@ -13,3 +13,4 @@ All notable changes to this project will be documented in this file.
 - ns form parsing into typed structs, with a stable sort; passes all parse_ns test cases (the test suite vendors cJSON to compare results)
 - formatter; `scs_format` produces real output and passes all format test cases
 - robustness tests: random, mutated, and truncated inputs never crash the formatter
+- the `standard-clj` command line program: list, check, fix (including stdin), config files (JSON and EDN), glob patterns, colored output

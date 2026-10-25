@@ -5,9 +5,10 @@ that follows a small set of simple, opinionated rules.
 
 [Standard Clojure Style]:https://github.com/oakmac/standard-clojure-style-js
 
-> **Status: complete, not yet released.** The port passes every test case from the JavaScript
-> implementation (parser, `ns` parsing, and formatting). It has not been tagged as a release yet; see
-> the [Roadmap](#roadmap).
+> **Status: complete, not yet released.** The library passes every test case from the JavaScript
+> implementation (parser, `ns` parsing, and formatting), and the `standard-clj` command line program
+> passes the JavaScript CLI's test scenarios. Nothing has been tagged as a release yet; see the
+> [Roadmap](#roadmap).
 
 ## Goals
 
@@ -22,7 +23,38 @@ that follows a small set of simple, opinionated rules.
 - **Trustworthy.** A formatter rewrites your source code, so there are no clever tricks here: simple
   data structures, explicit memory management, strict compiler warnings, and sanitizer runs in CI.
 
-## Public API
+## Command Line Usage
+
+`make` builds `build/standard-clj`, a single self-contained binary with the same interface as the
+[JavaScript CLI](https://github.com/oakmac/standard-clojure-style-js/blob/master/docs/cli.md):
+
+```sh
+# list the files that check / fix would process
+standard-clj list src/ test/
+
+# check formatting without changing anything (exit code 1 if a file needs formatting)
+standard-clj check src/ test/
+
+# format files in place
+standard-clj fix src/ test/ deps.edn
+
+# read from stdin, write to stdout
+echo '(ns my.app (:require [clojure.string :as str]))' | standard-clj fix -
+
+# glob patterns, ignores, and config files work as in the JavaScript CLI
+standard-clj check --include "src/**/*.{clj,cljs,cljc}" --ignore "src/generated/**/*"
+standard-clj check --config .standard-clj.edn
+```
+
+Run `standard-clj --help` for every option. `make install` puts the binary in `/usr/local/bin`
+(override with `PREFIX=`). Colored output is used when the output is a terminal; `NO_COLOR` and
+`FORCE_COLOR=0` turn it off anywhere and any other `FORCE_COLOR` value turns it on anywhere.
+
+Two small differences from the JavaScript CLI: an unknown command or option is reported as an error
+(exit code 1) instead of being silently ignored, and colors depend on whether the stream is a
+terminal rather than on the `TERM` variable alone.
+
+## Library API
 
 ```c
 #include "standard-clojure-style.h"
@@ -64,6 +96,10 @@ JavaScript `parse` function) may be added later; so far nothing has needed it.
 - **No global state.** All state for one `scs_format` call lives in a context struct that is passed
   explicitly to every function. The grammar is immutable static data. The library is safe to call
   from multiple threads.
+- **The CLI is a separate program** in `cli/` that uses the library only through its public header.
+  It depends on the vendored [cJSON](https://github.com/DaveGamble/cJSON) for JSON config files and
+  has its own small EDN reader and glob matcher (the documented glob features are `*`, `**`, and
+  `{a,b}`; `?` and `[...]` work too). The library itself has no dependencies.
 - **Nesting limit.** The parser is recursive, so pathological input (thousands of nested parens)
   could overflow the C stack. Instead, collections and reader macros may nest at most 500 levels
   deep; beyond that `scs_format` returns an error. Each level costs roughly 1 KB of stack, so the
@@ -78,7 +114,10 @@ You need a C compiler (GCC, Clang, or MSVC) and either `make` or CMake. For form
 [clang-format]:https://clang.llvm.org/docs/ClangFormat.html
 
 ```sh
-# build and run the unit tests
+# build the library and the standard-clj binary
+make
+
+# build and run the test suites (library and CLI)
 make test
 
 # run the unit tests with Address Sanitizer and Undefined Behavior Sanitizer
@@ -109,19 +148,24 @@ project, the suite has unit tests for the C-specific parts (UTF-8 handling, the 
 sorting) and robustness tests that feed random, mutated, and truncated inputs through `scs_format`
 to check that it never crashes: every input produces either formatted output or a clean error.
 
-The test suite is a single C file, [`test/test_main.c`](test/test_main.c), that `#include`s
-`standard-clojure-style.c` directly so that it can test the internal (`static`) functions. Its one
-dependency is [cJSON](https://github.com/DaveGamble/cJSON), vendored under `test/cjson/`, which
-reads the expected structures in the `ns` test cases. The library itself has no dependencies.
+There are two test programs. [`test/test_main.c`](test/test_main.c) tests the library and
+`#include`s `standard-clojure-style.c` directly so that it can test the internal (`static`)
+functions. [`test/test_cli.c`](test/test_cli.c) does the same with `cli/cli.c`, and runs the CLI
+in-process against a small project it creates under `build/`, with the same scenarios as the
+JavaScript CLI tests. Both use the vendored cJSON to read JSON.
 
 ## Project Layout
 
 ```
 standard-clojure-style.c    the library (everything is in this one file)
-standard-clojure-style.h    the public API
-test/test_main.c            the test suite
-test/cjson/                 cJSON, used by the test suite to read JSON (vendored, do not edit)
+standard-clojure-style.h    the public API of the library
+cli/cli.c, cli/cli.h        the standard-clj command line program
+cli/main.c                  its entry point
+test/framework.h            the shared test macros
+test/test_main.c            the library test suite
+test/test_cli.c             the CLI test suite
 test_cases/                 test cases generated by the JavaScript project (do not edit)
+vendor/cjson/               cJSON, used by the CLI and the tests (vendored, do not edit)
 Makefile                    build for Linux, macOS, MSYS2
 CMakeLists.txt              build for Windows / MSVC and IDEs
 ```
@@ -149,6 +193,7 @@ Standard Clojure Style JavaScript they implement.
 - [x] parser (terminal parsers, sequence parsers, grammar), tested against `test_parser/`
 - [x] `ns` form parsing, tested against `test_parse_ns/`
 - [x] formatter, tested against `test_format/`
+- [x] `standard-clj` command line program, tested against the JavaScript CLI scenarios
 - [ ] first release
 
 ## License

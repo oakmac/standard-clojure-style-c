@@ -2,9 +2,10 @@
 
 [cJSON](https://github.com/DaveGamble/cJSON) v1.7.18, MIT license (see LICENSE).
 
-Used only by the test suite, to read the `expected` structures in
-`test_cases/parse_ns_tests.json` and compare them against what the library
-parsed. The library itself has no dependencies.
+Used by the `standard-clj` command line program to read `.standard-clj.json`
+config files, and by the test suite to read the `expected` structures in
+`test_cases/parse_ns_tests.json`. The formatting library itself has no
+dependencies.
 
 The files are unmodified copies of the upstream release:
 
