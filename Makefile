@@ -15,11 +15,8 @@ CLANG_FORMAT ?= clang-format
 BUILD        := build
 
 # Strict warnings, and every warning is an error.
-# NOTE: -Wno-unused-function is TEMPORARY while the port is in progress: helper
-# functions are ported (and tested) before the code that calls them exists.
-# Remove it once the port is complete.
 WARNINGS := -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wstrict-prototypes \
-            -Wmissing-prototypes -Wno-unused-function -Werror
+            -Wmissing-prototypes -Werror
 CFLAGS   ?= -std=c99 -O2 $(WARNINGS)
 
 # the files we format (test/cjson/ is vendored and left as-is)

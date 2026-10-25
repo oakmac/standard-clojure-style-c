@@ -11,3 +11,5 @@ All notable changes to this project will be documented in this file.
 - UTF-8 string helpers, node and string lists, stack operations, whitespace and comment helpers
 - parser: combinators, hand-written text matchers, grammar, nesting depth limit; passes all parser test cases
 - ns form parsing into typed structs, with a stable sort; passes all parse_ns test cases (the test suite vendors cJSON to compare results)
+- formatter; `scs_format` produces real output and passes all format test cases
+- robustness tests: random, mutated, and truncated inputs never crash the formatter

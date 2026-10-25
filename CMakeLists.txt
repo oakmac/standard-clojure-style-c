@@ -21,14 +21,11 @@ set(CMAKE_C_EXTENSIONS OFF)
 option(SCS_BUILD_TESTS "Build the test suite" ON)
 
 # Strict warnings, and every warning is an error.
-# NOTE: unused-function warnings are disabled TEMPORARILY while the port is in
-# progress: helper functions are ported (and tested) before the code that calls
-# them exists. Remove -Wno-unused-function / /wd4505 once the port is complete.
 if(MSVC)
-  set(SCS_WARNINGS /W4 /WX /wd4505)
+  set(SCS_WARNINGS /W4 /WX)
 else()
   set(SCS_WARNINGS -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wstrict-prototypes
-                   -Wmissing-prototypes -Wno-unused-function -Werror)
+                   -Wmissing-prototypes -Werror)
 endif()
 
 add_library(standard_clojure_style STATIC standard-clojure-style.c)

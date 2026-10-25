@@ -5,9 +5,9 @@ that follows a small set of simple, opinionated rules.
 
 [Standard Clojure Style]:https://github.com/oakmac/standard-clojure-style-js
 
-> **Status: work in progress.** This library does not format anything yet. The port is being
-> built up in stages (see [Roadmap](#roadmap)) and will be ready to use when every test case from
-> the JavaScript implementation passes.
+> **Status: complete, not yet released.** The port passes every test case from the JavaScript
+> implementation (parser, `ns` parsing, and formatting). It has not been tagged as a release yet; see
+> the [Roadmap](#roadmap).
 
 ## Goals
 
@@ -36,9 +36,8 @@ if (result.status == SCS_STATUS_SUCCESS) {
 scs_format_result_free(&result);
 ```
 
-The header documents every field. The API above exists today, but `scs_format` reports an error
-until the port is complete. A `scs_parse` function that exposes the parse tree (the JavaScript
-`parse` function) will be added along with the parser.
+The header documents every field. A `scs_parse` function that exposes the parse tree (the
+JavaScript `parse` function) may be added later; so far nothing has needed it.
 
 ## Design Notes
 
@@ -105,7 +104,10 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 All compiler warnings are turned on and treated as errors, and CI runs the test suite on Linux,
-macOS, and Windows plus a sanitizer build on Linux.
+macOS, and Windows plus a sanitizer build on Linux. Besides the test cases from the JavaScript
+project, the suite has unit tests for the C-specific parts (UTF-8 handling, the arena, lists,
+sorting) and robustness tests that feed random, mutated, and truncated inputs through `scs_format`
+to check that it never crashes: every input produces either formatted output or a clean error.
 
 The test suite is a single C file, [`test/test_main.c`](test/test_main.c), that `#include`s
 `standard-clojure-style.c` directly so that it can test the internal (`static`) functions. Its one
@@ -146,7 +148,7 @@ Standard Clojure Style JavaScript they implement.
 - [x] string, stack, and array helpers, tested against the JavaScript internals tests
 - [x] parser (terminal parsers, sequence parsers, grammar), tested against `test_parser/`
 - [x] `ns` form parsing, tested against `test_parse_ns/`
-- [ ] formatter, tested against `test_format/`
+- [x] formatter, tested against `test_format/`
 - [ ] first release
 
 ## License

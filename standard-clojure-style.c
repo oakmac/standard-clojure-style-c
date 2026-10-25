@@ -260,11 +260,6 @@ static int str_compare(scs_str a, scs_str b) {
   return a.len < b.len ? -1 : 1;
 }
 
-/* does the string contain at least one character? */
-static bool str_has_chars(scs_str s) {
-  return s.len > 0;
-}
-
 /* Returns the number of bytes in the UTF-8 character that starts at byte_idx
  * (1 to 4). An invalid lead byte, a stray continuation byte, or a character
  * that is cut off by the end of the string counts as one byte, so a loop that
@@ -411,16 +406,6 @@ static int checked_len_add(scs_ctx *ctx, int a, int b) {
     scs_throw(ctx, "string is too large");
   }
   return a + b;
-}
-
-/* copies a string into the arena */
-static scs_str str_copy(scs_ctx *ctx, scs_str s) {
-  char *buf = str_alloc_buf(ctx, s.len);
-  copy_bytes(buf, s.data, s.len);
-  scs_str result;
-  result.data = buf;
-  result.len = s.len;
-  return result;
 }
 
 static scs_str str_concat(scs_ctx *ctx, scs_str s1, scs_str s2) {
@@ -622,25 +607,6 @@ static bool str_ends_with(scs_str s, scs_str suffix) {
   return suffix.len <= s.len && bytes_eq(s.data + (s.len - suffix.len), suffix.data, suffix.len);
 }
 
-/* replaces the first occurrence of find inside of s with replace
- * (returns s unchanged when s is empty, find is empty, or find is not found) */
-static scs_str str_replace_first(scs_ctx *ctx, scs_str s, scs_str find, scs_str replace) {
-  if (s.len == 0 || find.len == 0) {
-    return s;
-  }
-  int found_byte = str_find_bytes(s, find, 0);
-  if (found_byte == -1) {
-    return s;
-  }
-  scs_str head;
-  head.data = s.data;
-  head.len = found_byte;
-  scs_str tail;
-  tail.data = s.data + found_byte + find.len;
-  tail.len = s.len - found_byte - find.len;
-  return str_concat3(ctx, head, replace, tail);
-}
-
 /* replaces every occurrence of find inside of s with replace, scanning left to
  * right without overlap (returns s unchanged when find is empty or not found) */
 static scs_str str_replace_all(scs_ctx *ctx, scs_str s, scs_str find, scs_str replace) {
@@ -764,6 +730,15 @@ static scs_str strbuf_to_str(const scs_strbuf *buf) {
   return s;
 }
 
+/* removes leading and trailing whitespace from the contents */
+static void strbuf_trim(scs_strbuf *buf) {
+  scs_str trimmed = str_trim(strbuf_to_str(buf));
+  if (trimmed.len > 0 && trimmed.data != buf->data) {
+    memmove(buf->data, trimmed.data, (size_t)trimmed.len);
+  }
+  buf->len = trimmed.len;
+}
+
 /* -----------------------------------------------------------------------------
  * String Lists
  */
@@ -875,10 +850,20 @@ struct scs_node {
   int end_idx;
   scs_node_list children;
   /* these fields are used by the format_nodes function */
-  int orig_col_idx;
-  int printed_col_idx;
+  int orig_col_idx;    /* column of the node in the input (-1 until recorded) */
+  int printed_col_idx; /* column of the node in the output (-1 until printed) */
   int printed_line_idx;
-  bool was_slurped_up;
+  bool was_slurped_up; /* a closing paren that was moved up to the previous line */
+  /* these fields are only used for nodes on the paren stack (openers) */
+  int col_idx;
+  int line_idx;
+  scs_node *next_with_text;
+  scs_node *next_with_text_skipping_meta;
+  int paren_opener_line_idx;
+  scs_node_list opening_line_nodes; /* the nodes on the first line of this form */
+  bool rule3_active;
+  int rule3_num_spaces;
+  bool rule3_search_complete;
 };
 
 /* -----------------------------------------------------------------------------
@@ -1795,18 +1780,13 @@ static bool is_space_or_comma(scs_str ch) {
 /* removes trailing spaces and commas (but not newlines: this operates on a single line) */
 static scs_str remove_trailing_whitespace(scs_str txt) {
   int end_idx = txt.len;
-  while (end_idx > 0 && (txt.data[end_idx - 1] == ' ' || txt.data[end_idx - 1] == ',')) {
+  while (end_idx > 0 && is_space_or_comma(str_slice(txt, end_idx - 1, end_idx))) {
     end_idx--;
   }
   scs_str result;
   result.data = txt.data;
   result.len = end_idx;
   return result;
-}
-
-/* returns the text after the last newline (all of txt when there is no newline) */
-static scs_str remove_chars_up_to_newline(scs_str txt) {
-  return substr(txt, str_last_index_of(txt, STR("\n")) + 1, -1);
 }
 
 /* is there a comma after the last newline? */
@@ -4200,6 +4180,1920 @@ static scs_ns *parse_ns(scs_ctx *ctx, const scs_node_list *nodes_arr) {
 }
 
 /* -----------------------------------------------------------------------------
+ * Formatter Helpers
+ */
+
+typedef bool (*scs_node_predicate)(const scs_node *n);
+
+static bool always_true(const scs_node *n) {
+  (void)n;
+  return true;
+}
+
+/* Searches forward from start_idx for the next meaningful text node, skipping
+ * over metadata markers (^, ^{...}) and reader discards (#_) together with the
+ * forms they apply to. Returns NULL if there is none. */
+static scs_node *find_next_text_node_skipping_meta(const scs_node_list *nodes_arr, int start_idx) {
+  int paren_depth = 0;
+  int string_depth = 0;
+  int forms_to_skip = 0;
+
+  for (int idx = start_idx; idx < nodes_arr->size; idx++) {
+    scs_node *node = nodes_arr->items[idx];
+
+    /* only text-bearing non-whitespace, non-comment nodes matter */
+    if (!node_contains_text(node) || is_whitespace_node(node) || is_comment_node(node)) {
+      continue;
+    }
+
+    if (is_paren_opener(node)) {
+      if (string_depth == 0) {
+        if (forms_to_skip > 0 && paren_depth == 0) {
+          paren_depth = 1;
+        } else if (paren_depth > 0) {
+          paren_depth++;
+        } else {
+          return node;
+        }
+      }
+    } else if (is_paren_closer(node)) {
+      if (string_depth == 0) {
+        if (paren_depth > 0) {
+          paren_depth--;
+          if (paren_depth == 0) {
+            forms_to_skip--;
+          }
+        } else {
+          return node;
+        }
+      }
+    } else if (is_string_opener(node)) {
+      if (forms_to_skip > 0 && paren_depth == 0 && string_depth == 0) {
+        string_depth = 1;
+      } else if (paren_depth > 0 || string_depth > 0) {
+        string_depth++;
+      } else {
+        return node;
+      }
+    } else if (is_string_closer(node)) {
+      if (string_depth > 0) {
+        string_depth--;
+        if (string_depth == 0 && paren_depth == 0) {
+          forms_to_skip--;
+        }
+      } else {
+        return node;
+      }
+    } else {
+      /* a token, marker, or string body */
+      if (paren_depth > 0 || string_depth > 0) {
+        /* inside a form we are skipping */
+      } else if (is_meta_marker(node) || is_discard_node(node)) {
+        /* a marker: skip the next complete form */
+        forms_to_skip++;
+      } else if (forms_to_skip > 0) {
+        /* we just skipped a single-token form (such as `long` or `:private`) */
+        forms_to_skip--;
+      } else {
+        return node;
+      }
+    }
+  }
+  return NULL;
+}
+
+/* Searches backwards from start_idx for the previous node with text that comes
+ * before the node with starting_node_id. Returns NULL if there is none. */
+static scs_node *find_prev_node_with_text(const scs_node_list *all_nodes, int start_idx,
+                                          int starting_node_id) {
+  bool before_starting_node = false;
+  for (int idx = start_idx; idx > 0 && idx < all_nodes->size; idx--) {
+    scs_node *node = all_nodes->items[idx];
+    if (!before_starting_node) {
+      if (node->id == starting_node_id) {
+        before_starting_node = true;
+      }
+    } else if (node_contains_text(node)) {
+      return node;
+    }
+  }
+  return NULL;
+}
+
+/* Searches forward from start_idx for a node that satisfies pred and comes
+ * after the node with specific_node_id. Returns NULL if there is none. */
+static scs_node *find_next_node_with_predicate_after_specific_node(const scs_node_list *all_nodes,
+                                                                   int start_idx,
+                                                                   scs_node_predicate pred,
+                                                                   int specific_node_id) {
+  bool after_specific_node = false;
+  for (int idx = start_idx; idx >= 0 && idx < all_nodes->size; idx++) {
+    scs_node *node = all_nodes->items[idx];
+    if (!after_specific_node) {
+      if (node->id == specific_node_id) {
+        after_specific_node = true;
+      }
+    } else if (pred(node)) {
+      return node;
+    }
+  }
+  return NULL;
+}
+
+/* searches backwards from start_idx for a node that satisfies pred */
+static scs_node *find_prev_node_with_predicate(const scs_node_list *all_nodes, int start_idx,
+                                               scs_node_predicate pred) {
+  for (int idx = start_idx; idx >= 0 && idx < all_nodes->size; idx--) {
+    if (pred(all_nodes->items[idx])) {
+      return all_nodes->items[idx];
+    }
+  }
+  return NULL;
+}
+
+/* are all of the nodes on the next line already slurped up or whitespace nodes? */
+static bool are_forward_nodes_already_slurped(const scs_node_list *nodes, int idx) {
+  for (; idx < nodes->size; idx++) {
+    scs_node *node = nodes->items[idx];
+    if (is_newline_node(node)) {
+      return true;
+    }
+    if (node->text.len == 0) {
+      continue;
+    }
+    if (!(node->was_slurped_up || is_whitespace_node(node))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/* Searches forward from idx for closing paren nodes that could be slurped up
+ * to the current line, including the whitespace and comment nodes between
+ * them. Stops at the first node that is anything else. */
+static scs_node_list find_forward_closing_parens(scs_ctx *ctx, const scs_node_list *nodes,
+                                                 int idx) {
+  scs_node_list closers = {NULL, 0, 0};
+  for (; idx < nodes->size; idx++) {
+    scs_node *node = nodes->items[idx];
+    if (is_newline_node_with_comma_on_next_line(node)) {
+      break;
+    }
+    if (is_whitespace_node(node) || is_paren_closer(node) || is_comment_node(node)) {
+      node_list_push(ctx, &closers, node);
+    } else {
+      break;
+    }
+  }
+  return closers;
+}
+
+/* records the original column of every node on the line starting at idx,
+ * stopping at the next newline node */
+static void record_original_col_indexes(const scs_node_list *nodes, int idx) {
+  int col_idx = 0;
+  if (idx < nodes->size && is_newline_node(nodes->items[idx])) {
+    col_idx = num_spaces_after_newline(nodes->items[idx]);
+    idx++;
+  }
+
+  for (; idx < nodes->size; idx++) {
+    scs_node *node = nodes->items[idx];
+    if (is_newline_node(node)) {
+      break;
+    }
+    if (node->text.len > 0) {
+      node->orig_col_idx = col_idx;
+      col_idx = col_idx + str_len(node->text);
+    } else if (is_tag_node(node)) {
+      node->orig_col_idx = col_idx;
+      col_idx = col_idx + 1;
+    }
+  }
+}
+
+static bool has_commas_after_newline(const scs_node *node) {
+  return is_whitespace_node(node) && txt_has_commas_after_newline(node->text);
+}
+
+/* starting from idx, is the next line a line with only a comment on it? */
+static bool is_next_line_a_comment_line(const scs_node_list *nodes, int idx) {
+  scs_node *n1 = idx < nodes->size ? nodes->items[idx] : NULL;
+  scs_node *n2 = idx + 1 < nodes->size ? nodes->items[idx + 1] : NULL;
+  if (n1 && n2) {
+    return is_comment_node(n1) && is_newline_node(n2);
+  }
+  if (n1) {
+    return is_comment_node(n1);
+  }
+  return false;
+}
+
+/* returns the number of spaces to indent a line inside wrapping_opener */
+static int num_spaces_for_indentation(scs_ctx *ctx, const scs_node *wrapping_opener) {
+  if (wrapping_opener == NULL) {
+    return 0;
+  }
+
+  const scs_node *next_node_after_opener = wrapping_opener->next_with_text_skipping_meta;
+  int opener_text_length = str_len(wrapping_opener->text);
+  int opener_col_idx = wrapping_opener->printed_col_idx;
+  int directly_underneath_opener = opener_col_idx + opener_text_length;
+
+  if (is_reader_conditional_opener(wrapping_opener)) {
+    return directly_underneath_opener;
+  }
+  if (next_node_after_opener && is_paren_opener(next_node_after_opener)) {
+    if (is_map_literal_opener(wrapping_opener) || is_vector_literal_opener(wrapping_opener) ||
+        is_single_paren_opener(wrapping_opener)) {
+      return opener_col_idx + 1;
+    }
+    if (is_set_literal_opener(wrapping_opener) || is_anon_fn_opener(wrapping_opener)) {
+      return opener_col_idx + 2;
+    }
+    scs_throw(ctx, "Error inside num_spaces_for_indentation function. This condition should be "
+                   "unreachable.");
+  }
+  if (is_map_literal_opener(wrapping_opener) || is_vector_literal_opener(wrapping_opener)) {
+    return opener_col_idx + 1;
+  }
+  if (is_anon_fn_opener(wrapping_opener)) {
+    return opener_col_idx + 3;
+  }
+  if (is_namespaced_map_opener(wrapping_opener)) {
+    return opener_col_idx + str_len(wrapping_opener->text);
+  }
+  /* indent two spaces from the wrapping opener */
+  return opener_col_idx + 2;
+}
+
+/* inserts a space between a comment's leading semicolons and its text:
+ * ";foo" becomes "; foo" (text that does not need one is returned unchanged) */
+static scs_str add_space_inside_comment(scs_ctx *ctx, scs_str comment_txt) {
+  int idx = 0;
+  while (idx < comment_txt.len && comment_txt.data[idx] == ';') {
+    idx++;
+  }
+  if (idx == 0 || idx >= comment_txt.len || comment_txt.data[idx] == ' ') {
+    return comment_txt;
+  }
+  return str_concat3(ctx, str_slice(comment_txt, 0, idx), STR(" "),
+                     str_slice(comment_txt, idx, comment_txt.len));
+}
+
+/* Is there a #_ :standard-clj/ignore-file marker (or #_ {:standard-clj/ignore-file true})
+ * before the first ns form? */
+static bool look_for_ignore_file(const scs_node_list *nodes_arr) {
+  for (int idx = 0; idx < nodes_arr->size; idx++) {
+    scs_node *node = nodes_arr->items[idx];
+
+    if (is_discard_node(node)) {
+      scs_node *next1 = find_next_node_with_predicate_after_specific_node(
+          nodes_arr, idx, node_contains_text_and_not_whitespace, node->id);
+      if (is_standard_clj_ignore_file_keyword(next1)) {
+        return true;
+      }
+      if (node_text_is(next1, "{")) {
+        scs_node *next2 = find_next_node_with_predicate_after_specific_node(
+            nodes_arr, idx, node_contains_text_and_not_whitespace, next1->id);
+        if (is_standard_clj_ignore_file_keyword(next2)) {
+          scs_node *next3 = find_next_node_with_predicate_after_specific_node(
+              nodes_arr, idx, node_contains_text_and_not_whitespace, next2->id);
+          if (node_name_eq(next3, "token") && node_text_is(next3, "true")) {
+            return true;
+          }
+        }
+      }
+    } else if (is_ns_node(node)) {
+      return false;
+    }
+  }
+  return false;
+}
+
+/* -----------------------------------------------------------------------------
+ * Format the ns Form
+ */
+
+/* appends each comment line, indented, followed by a newline */
+static void print_comments_above(scs_ctx *ctx, scs_strbuf *out, const scs_str_list *comments_above,
+                                 scs_str indentation) {
+  if (comments_above == NULL) {
+    return;
+  }
+  for (int idx = 0; idx < comments_above->size; idx++) {
+    strbuf_append(ctx, out, indentation);
+    strbuf_append(ctx, out, comments_above->items[idx]);
+    strbuf_append(ctx, out, STR("\n"));
+  }
+}
+
+/* Returns the distinct platforms found in a list of platform strings (empty
+ * strings meaning "no platform" are ignored), sorted, with :default last. */
+static scs_str_list get_platforms_from_array(scs_ctx *ctx, const scs_str_list *platform_strs) {
+  bool has_default = false;
+  scs_str_list platforms = {NULL, 0, 0};
+  for (int idx = 0; idx < platform_strs->size; idx++) {
+    scs_str platform = platform_strs->items[idx];
+    if (platform.len == 0) {
+      continue;
+    }
+    if (str_eq_cstr(platform, ":default")) {
+      has_default = true;
+      continue;
+    }
+    bool seen = false;
+    for (int i = 0; i < platforms.size; i++) {
+      if (str_eq(platforms.items[i], platform)) {
+        seen = true;
+      }
+    }
+    if (!seen) {
+      str_list_push(ctx, &platforms, platform);
+    }
+  }
+
+  stable_sort(ctx, platforms.items, platforms.size, sizeof(scs_str), compare_strings);
+  if (has_default) {
+    str_list_push(ctx, &platforms, STR(":default"));
+  }
+  return platforms;
+}
+
+static scs_str_list require_platforms(scs_ctx *ctx, const scs_ns_require_list *reqs) {
+  scs_str_list platforms = {NULL, 0, 0};
+  for (int idx = 0; idx < reqs->size; idx++) {
+    str_list_push(ctx, &platforms, reqs->items[idx].platform);
+  }
+  return platforms;
+}
+
+static scs_str_list symbol_platforms(scs_ctx *ctx, const scs_ns_symbol_list *symbols) {
+  scs_str_list platforms = {NULL, 0, 0};
+  for (int idx = 0; idx < symbols->size; idx++) {
+    str_list_push(ctx, &platforms, symbols->items[idx].platform);
+  }
+  return platforms;
+}
+
+static scs_str_list rename_platforms(scs_ctx *ctx, const scs_ns_rename_list *renames) {
+  scs_str_list platforms = {NULL, 0, 0};
+  for (int idx = 0; idx < renames->size; idx++) {
+    str_list_push(ctx, &platforms, renames->items[idx].platform);
+  }
+  return platforms;
+}
+
+static scs_str_list import_platforms(scs_ctx *ctx, const scs_ns_import_list *imports) {
+  scs_str_list platforms = {NULL, 0, 0};
+  for (int idx = 0; idx < imports->size; idx++) {
+    str_list_push(ctx, &platforms, imports->items[idx].platform);
+  }
+  return platforms;
+}
+
+/* Is there at most one require per platform? Then the standard reader
+ * conditional #?( can be used instead of the splicing #?@( */
+static bool only_one_require_per_platform(scs_ctx *ctx, const scs_ns_require_list *reqs) {
+  scs_str_list seen = {NULL, 0, 0};
+  for (int idx = 0; idx < reqs->size; idx++) {
+    scs_str platform = reqs->items[idx].platform;
+    if (platform.len == 0) {
+      continue;
+    }
+    for (int i = 0; i < seen.size; i++) {
+      if (str_eq(seen.items[i], platform)) {
+        return false;
+      }
+    }
+    str_list_push(ctx, &seen, platform);
+  }
+  return true;
+}
+
+/* does an item with this platform belong to the filter? an empty filter
+ * selects the items that have no platform */
+static bool platform_matches(scs_str item_platform, scs_str platform) {
+  if (platform.len == 0) {
+    return item_platform.len == 0;
+  }
+  return str_eq(item_platform, platform);
+}
+
+static scs_ns_require_list
+filter_requires_on_platform(scs_ctx *ctx, const scs_ns_require_list *reqs, scs_str platform) {
+  scs_ns_require_list filtered = {NULL, 0, 0};
+  for (int idx = 0; idx < reqs->size; idx++) {
+    if (platform_matches(reqs->items[idx].platform, platform)) {
+      LIST_PUSH(ctx, &filtered, reqs->items[idx]);
+    }
+  }
+  return filtered;
+}
+
+static scs_ns_import_list
+filter_imports_on_platform(scs_ctx *ctx, const scs_ns_import_list *imports, scs_str platform) {
+  scs_ns_import_list filtered = {NULL, 0, 0};
+  for (int idx = 0; idx < imports->size; idx++) {
+    if (platform_matches(imports->items[idx].platform, platform)) {
+      LIST_PUSH(ctx, &filtered, imports->items[idx]);
+    }
+  }
+  return filtered;
+}
+
+static scs_ns_rename_list
+filter_renames_on_platform(scs_ctx *ctx, const scs_ns_rename_list *renames, scs_str platform) {
+  scs_ns_rename_list filtered = {NULL, 0, 0};
+  for (int idx = 0; idx < renames->size; idx++) {
+    if (platform_matches(renames->items[idx].platform, platform)) {
+      LIST_PUSH(ctx, &filtered, renames->items[idx]);
+    }
+  }
+  return filtered;
+}
+
+/* the symbols of the items that match the platform filter */
+static scs_str_list symbols_on_platform(scs_ctx *ctx, const scs_ns_symbol_list *symbols,
+                                        scs_str platform) {
+  scs_str_list filtered = {NULL, 0, 0};
+  for (int idx = 0; idx < symbols->size; idx++) {
+    if (platform_matches(symbols->items[idx].platform, platform)) {
+      str_list_push(ctx, &filtered, symbols->items[idx].symbol);
+    }
+  }
+  return filtered;
+}
+
+/* all of the symbols in a symbol list */
+static scs_str_list all_symbols(scs_ctx *ctx, const scs_ns_symbol_list *symbols) {
+  scs_str_list result = {NULL, 0, 0};
+  for (int idx = 0; idx < symbols->size; idx++) {
+    str_list_push(ctx, &result, symbols->items[idx].symbol);
+  }
+  return result;
+}
+
+/* "from1 to1, from2 to2" */
+static scs_str format_renames_list(scs_ctx *ctx, const scs_ns_rename_list *itms) {
+  scs_strbuf s = {NULL, 0, 0};
+  for (int idx = 0; idx < itms->size; idx++) {
+    strbuf_append(ctx, &s, itms->items[idx].from_symbol);
+    strbuf_append(ctx, &s, STR(" "));
+    strbuf_append(ctx, &s, itms->items[idx].to_symbol);
+    if (idx + 1 < itms->size) {
+      strbuf_append(ctx, &s, STR(", "));
+    }
+  }
+  return strbuf_to_str(&s);
+}
+
+static scs_str format_require_line(scs_ctx *ctx, const scs_ns_require *req,
+                                   scs_str initial_indentation, bool metadata_inline) {
+  scs_strbuf out = {NULL, 0, 0};
+  scs_str require_indentation = initial_indentation;
+
+  print_comments_above(ctx, &out, req->comments_above, initial_indentation);
+
+  if (req->metadata != NULL && req->metadata->size > 0) {
+    strbuf_append(ctx, &out, initial_indentation);
+    strbuf_append(ctx, &out, str_join(ctx, req->metadata, STR(" ")));
+    if (metadata_inline) {
+      strbuf_append(ctx, &out, STR(" "));
+      require_indentation = EMPTY_STR;
+    } else {
+      strbuf_append(ctx, &out, STR("\n"));
+    }
+  }
+
+  strbuf_append(ctx, &out, require_indentation);
+  strbuf_append(ctx, &out, STR("["));
+  strbuf_append(ctx, &out, req->symbol);
+
+  if (req->as.len > 0) {
+    strbuf_append(ctx, &out, STR(" :as "));
+    strbuf_append(ctx, &out, req->as);
+  } else if (req->as_alias.len > 0) {
+    strbuf_append(ctx, &out, STR(" :as-alias "));
+    strbuf_append(ctx, &out, req->as_alias);
+  }
+
+  if (req->default_symbol.len > 0) {
+    strbuf_append(ctx, &out, STR(" :default "));
+    strbuf_append(ctx, &out, req->default_symbol);
+  }
+
+  /* NOTE: this does not work if the individual :refer symbols are wrapped in a reader conditional
+   */
+  if (!req->refer_all && req->refer != NULL && req->refer->size > 0) {
+    strbuf_append(ctx, &out, STR(" :refer ["));
+    scs_str_list refer_symbols = all_symbols(ctx, req->refer);
+    strbuf_append(ctx, &out, str_join(ctx, &refer_symbols, STR(" ")));
+    strbuf_append(ctx, &out, STR("]"));
+  } else if (req->refer_all) {
+    strbuf_append(ctx, &out, STR(" :refer :all"));
+  }
+
+  /* NOTE: this does not work if the individual :exclude symbols are wrapped in a reader conditional
+   */
+  if (req->exclude != NULL && req->exclude->size > 0) {
+    strbuf_append(ctx, &out, STR(" :exclude ["));
+    scs_str_list exclude_symbols = all_symbols(ctx, req->exclude);
+    strbuf_append(ctx, &out, str_join(ctx, &exclude_symbols, STR(" ")));
+    strbuf_append(ctx, &out, STR("]"));
+  }
+
+  if (req->has_include_macros) {
+    strbuf_append(ctx, &out,
+                  req->include_macros ? STR(" :include-macros true")
+                                      : STR(" :include-macros false"));
+  }
+
+  if (req->refer_macros != NULL && req->refer_macros->size > 0) {
+    strbuf_append(ctx, &out, STR(" :refer-macros ["));
+    strbuf_append(ctx, &out, str_join(ctx, req->refer_macros, STR(" ")));
+    strbuf_append(ctx, &out, STR("]"));
+  }
+
+  if (req->rename != NULL && req->rename->size > 0) {
+    strbuf_append(ctx, &out, STR(" :rename {"));
+    strbuf_append(ctx, &out, format_renames_list(ctx, req->rename));
+    strbuf_append(ctx, &out, STR("}"));
+  }
+
+  strbuf_append(ctx, &out, STR("]"));
+  return strbuf_to_str(&out);
+}
+
+/* the :refer-clojure keys that are present: :exclude, :only, :rename */
+static scs_str_list get_refer_clojure_keys(scs_ctx *ctx,
+                                           const scs_ns_refer_clojure *refer_clojure) {
+  scs_str_list keys = {NULL, 0, 0};
+  if (refer_clojure != NULL) {
+    if (refer_clojure->exclude != NULL) {
+      str_list_push(ctx, &keys, STR(":exclude"));
+    }
+    if (refer_clojure->only != NULL) {
+      str_list_push(ctx, &keys, STR(":only"));
+    }
+    if (refer_clojure->rename != NULL) {
+      str_list_push(ctx, &keys, STR(":rename"));
+    }
+  }
+  return keys;
+}
+
+/* ":kwd [sym1 sym2]" */
+static scs_str format_keyword_followed_by_list_of_symbols(scs_ctx *ctx, scs_str kwd,
+                                                          const scs_str_list *symbols) {
+  scs_strbuf s = {NULL, 0, 0};
+  strbuf_append(ctx, &s, kwd);
+  strbuf_append(ctx, &s, STR(" ["));
+  strbuf_append(ctx, &s, str_join(ctx, symbols, STR(" ")));
+  strbuf_append(ctx, &s, STR("]"));
+  return strbuf_to_str(&s);
+}
+
+/* formats a (:refer-clojure ...) form that has only :exclude or only :only */
+static scs_str format_refer_clojure_single_keyword(scs_ctx *ctx, const scs_ns *ns,
+                                                   const scs_ns_symbol_list *symbols_arr,
+                                                   scs_str kwd) {
+  scs_str_list platform_strs = symbol_platforms(ctx, symbols_arr);
+  scs_str_list platforms = get_platforms_from_array(ctx, &platform_strs);
+  int num_platforms = platforms.size;
+  scs_str_list symbols_for_all_platforms = symbols_on_platform(ctx, symbols_arr, EMPTY_STR);
+  int num_symbols_for_all_platforms = symbols_for_all_platforms.size;
+  scs_strbuf s = {NULL, 0, 0};
+
+  if (num_platforms == 0) {
+    /* no reader conditionals: print all of the symbols */
+    strbuf_append(ctx, &s, STR("\n"));
+    print_comments_above(ctx, &s, ns->refer_clojure_comments_above, STR("  "));
+    strbuf_append(ctx, &s, STR("  (:refer-clojure "));
+    strbuf_append(ctx, &s,
+                  format_keyword_followed_by_list_of_symbols(ctx, kwd, &symbols_for_all_platforms));
+    strbuf_append(ctx, &s, STR(")"));
+  } else if (num_platforms == 1 && num_symbols_for_all_platforms == 0) {
+    /* all symbols are for a single platform: wrap the entire (:refer-clojure)
+     * in a single reader conditional */
+    scs_str_list symbols2 = all_symbols(ctx, symbols_arr);
+    strbuf_append(ctx, &s, STR("\n  #?("));
+    strbuf_append(ctx, &s, platforms.items[0]);
+    strbuf_append(ctx, &s, STR("\n"));
+    print_comments_above(ctx, &s, ns->refer_clojure_comments_above, STR("     "));
+    strbuf_append(ctx, &s, STR("     (:refer-clojure "));
+    strbuf_append(ctx, &s, format_keyword_followed_by_list_of_symbols(ctx, kwd, &symbols2));
+    strbuf_append(ctx, &s, STR("))"));
+  } else if (num_platforms > 1 && num_symbols_for_all_platforms == 0) {
+    /* all symbols are for specific platforms across multiple platforms: wrap a
+     * separate (:refer-clojure) per platform inside #?(...)
+     * (:exclude #?@(...) cannot be used here because #?@ splicing outside a
+     * collection produces invalid Clojure) */
+    strbuf_append(ctx, &s, STR("\n"));
+    print_comments_above(ctx, &s, ns->refer_clojure_comments_above, STR("  "));
+    strbuf_append(ctx, &s, STR("  #?("));
+    for (int platform_idx = 0; platform_idx < num_platforms; platform_idx++) {
+      scs_str platform = platforms.items[platform_idx];
+      scs_str_list symbols_for_platform = symbols_on_platform(ctx, symbols_arr, platform);
+      if (platform_idx != 0) {
+        strbuf_append(ctx, &s, STR("\n     "));
+      }
+      strbuf_append(ctx, &s, platform);
+      strbuf_append(ctx, &s, STR(" (:refer-clojure "));
+      strbuf_append(ctx, &s,
+                    format_keyword_followed_by_list_of_symbols(ctx, kwd, &symbols_for_platform));
+      strbuf_append(ctx, &s, STR(")"));
+    }
+    strbuf_append(ctx, &s, STR(")"));
+  } else {
+    /* a mix of symbols for all platforms and some for specific platforms */
+    strbuf_append(ctx, &s, STR("\n"));
+    print_comments_above(ctx, &s, ns->refer_clojure_comments_above, STR("  "));
+    strbuf_append(ctx, &s, STR("  (:refer-clojure\n    "));
+    strbuf_append(ctx, &s, kwd);
+    strbuf_append(ctx, &s, STR(" ["));
+    strbuf_append(ctx, &s, str_join(ctx, &symbols_for_all_platforms, STR(" ")));
+
+    bool is_exclude = str_eq_cstr(kwd, ":exclude");
+    bool is_only = str_eq_cstr(kwd, ":only");
+    if (is_exclude) {
+      strbuf_append(ctx, &s, STR("\n"));
+      strbuf_append(ctx, &s, repeat_string(ctx, STR(" "), 14));
+    } else if (is_only) {
+      strbuf_append(ctx, &s, STR("\n"));
+      strbuf_append(ctx, &s, repeat_string(ctx, STR(" "), 11));
+    }
+
+    strbuf_append(ctx, &s, STR("#?@("));
+    for (int platform_idx = 0; platform_idx < num_platforms; platform_idx++) {
+      scs_str platform = platforms.items[platform_idx];
+      scs_str_list symbols_for_platform = symbols_on_platform(ctx, symbols_arr, platform);
+      strbuf_append(
+          ctx, &s,
+          format_keyword_followed_by_list_of_symbols(ctx, platform, &symbols_for_platform));
+      if (platform_idx + 1 != num_platforms) {
+        if (is_exclude) {
+          strbuf_append(ctx, &s, STR("\n"));
+          strbuf_append(ctx, &s, repeat_string(ctx, STR(" "), 18));
+        } else if (is_only) {
+          strbuf_append(ctx, &s, STR("\n"));
+          strbuf_append(ctx, &s, repeat_string(ctx, STR(" "), 15));
+        }
+      }
+    }
+    strbuf_append(ctx, &s, STR(")])"));
+  }
+  return strbuf_to_str(&s);
+}
+
+static scs_str format_refer_clojure(scs_ctx *ctx, const scs_ns *ns) {
+  const scs_ns_refer_clojure *rc = ns->refer_clojure;
+  scs_str_list keys = get_refer_clojure_keys(ctx, rc);
+  int num_keys = keys.size;
+  scs_strbuf s = {NULL, 0, 0};
+
+  if (num_keys == 0) {
+    return EMPTY_STR;
+  }
+  if (num_keys == 1 && str_eq_cstr(keys.items[0], ":exclude")) {
+    return format_refer_clojure_single_keyword(ctx, ns, rc->exclude, STR(":exclude"));
+  }
+  if (num_keys == 1 && str_eq_cstr(keys.items[0], ":only")) {
+    return format_refer_clojure_single_keyword(ctx, ns, rc->only, STR(":only"));
+  }
+  if (num_keys == 1 && str_eq_cstr(keys.items[0], ":rename")) {
+    scs_str_list platform_strs = rename_platforms(ctx, rc->rename);
+    scs_str_list platforms = get_platforms_from_array(ctx, &platform_strs);
+    int num_platforms = platforms.size;
+    scs_ns_rename_list non_platform_specific_renames =
+        filter_renames_on_platform(ctx, rc->rename, EMPTY_STR);
+    bool all_renames_for_same_platform =
+        non_platform_specific_renames.size == 0 && num_platforms > 0;
+
+    if (num_platforms == 0) {
+      strbuf_append(ctx, &s, STR("\n"));
+      print_comments_above(ctx, &s, ns->refer_clojure_comments_above, STR("  "));
+      strbuf_append(ctx, &s, STR("  (:refer-clojure :rename {"));
+      strbuf_append(ctx, &s, format_renames_list(ctx, rc->rename));
+      strbuf_append(ctx, &s, STR("})"));
+    } else if (num_platforms == 1 && all_renames_for_same_platform) {
+      strbuf_append(ctx, &s, STR("\n  #?("));
+      strbuf_append(ctx, &s, platforms.items[0]);
+      strbuf_append(ctx, &s, STR("\n"));
+      print_comments_above(ctx, &s, ns->refer_clojure_comments_above, STR("     "));
+      strbuf_append(ctx, &s, STR("     (:refer-clojure :rename {"));
+      strbuf_append(ctx, &s, format_renames_list(ctx, rc->rename));
+      strbuf_append(ctx, &s, STR("}))"));
+    } else {
+      strbuf_append(ctx, &s, STR("\n  (:refer-clojure\n    :rename {"));
+      strbuf_append(ctx, &s, format_renames_list(ctx, &non_platform_specific_renames));
+      strbuf_append(ctx, &s, STR("\n             #?@("));
+      for (int platform_idx = 0; platform_idx < num_platforms; platform_idx++) {
+        scs_str platform_str = platforms.items[platform_idx];
+        scs_ns_rename_list platform_renames =
+            filter_renames_on_platform(ctx, rc->rename, platform_str);
+        if (platform_idx != 0) {
+          strbuf_append(ctx, &s, STR("\n                 "));
+        }
+        strbuf_append(ctx, &s, platform_str);
+        strbuf_append(ctx, &s, STR(" ["));
+        strbuf_append(ctx, &s, format_renames_list(ctx, &platform_renames));
+        strbuf_append(ctx, &s, STR("]"));
+      }
+      strbuf_append(ctx, &s, STR(")})"));
+    }
+    return strbuf_to_str(&s);
+  }
+
+  /* multiple keys: each one on its own line */
+  strbuf_append(ctx, &s, STR("\n  (:refer-clojure"));
+  if (rc->exclude != NULL && rc->exclude->size > 0) {
+    scs_str_list exclude_symbols = all_symbols(ctx, rc->exclude);
+    strbuf_append(ctx, &s, STR("\n    "));
+    strbuf_append(
+        ctx, &s,
+        format_keyword_followed_by_list_of_symbols(ctx, STR(":exclude"), &exclude_symbols));
+  }
+  if (rc->only != NULL && rc->only->size > 0) {
+    scs_str_list only_symbols = all_symbols(ctx, rc->only);
+    strbuf_append(ctx, &s, STR("\n    "));
+    strbuf_append(ctx, &s,
+                  format_keyword_followed_by_list_of_symbols(ctx, STR(":only"), &only_symbols));
+  }
+  if (rc->rename != NULL && rc->rename->size > 0) {
+    strbuf_append(ctx, &s, STR("\n    :rename {"));
+    strbuf_append(ctx, &s, format_renames_list(ctx, rc->rename));
+    strbuf_append(ctx, &s, STR("}"));
+  }
+  strbuf_append(ctx, &s, STR(")"));
+  return strbuf_to_str(&s);
+}
+
+/* appends the value of one structured :gen-class key (:constructors, :methods,
+ * :exposes, :exposes-methods) as a map or vector literal, one entry per line,
+ * aligned under the first entry */
+static void format_gen_class_structured_value(scs_ctx *ctx, scs_strbuf *out, int key,
+                                              const scs_ns_gen_class *gc, int indentation_level) {
+  const char *key_name = gen_class_key_names[key];
+  int entry_indentation_level = indentation_level + (int)strlen(key_name) + 3;
+  scs_str entry_indentation = repeat_string(ctx, STR(" "), entry_indentation_level);
+
+  if (key == GEN_CLASS_CONSTRUCTORS) {
+    if (gc->constructors.size == 0) {
+      strbuf_append(ctx, out, STR(" {}"));
+      return;
+    }
+    for (int idx = 0; idx < gc->constructors.size; idx++) {
+      const scs_gen_class_constructor *constructor = &gc->constructors.items[idx];
+      if (idx == 0) {
+        strbuf_append(ctx, out, STR(" {"));
+      } else {
+        strbuf_append(ctx, out, STR("\n"));
+        strbuf_append(ctx, out, entry_indentation);
+      }
+      if (constructor->metadata.len > 0) {
+        strbuf_append(ctx, out, constructor->metadata);
+        strbuf_append(ctx, out, STR(" "));
+      }
+      strbuf_append(ctx, out, STR("["));
+      strbuf_append(ctx, out, str_join(ctx, &constructor->parameter_types, STR(" ")));
+      strbuf_append(ctx, out, STR("] ["));
+      strbuf_append(ctx, out, str_join(ctx, &constructor->super_parameter_types, STR(" ")));
+      strbuf_append(ctx, out, STR("]"));
+    }
+    strbuf_append(ctx, out, STR("}"));
+  } else if (key == GEN_CLASS_METHODS) {
+    if (gc->methods.size == 0) {
+      strbuf_append(ctx, out, STR(" []"));
+      return;
+    }
+    for (int idx = 0; idx < gc->methods.size; idx++) {
+      const scs_gen_class_method *method = &gc->methods.items[idx];
+      if (idx == 0) {
+        strbuf_append(ctx, out, STR(" ["));
+      } else {
+        strbuf_append(ctx, out, STR("\n"));
+        strbuf_append(ctx, out, entry_indentation);
+      }
+      if (method->metadata.len > 0) {
+        strbuf_append(ctx, out, method->metadata);
+        strbuf_append(ctx, out, STR(" "));
+      }
+      strbuf_append(ctx, out, STR("["));
+      strbuf_append(ctx, out, method->name);
+      strbuf_append(ctx, out, STR(" ["));
+      strbuf_append(ctx, out, str_join(ctx, &method->parameter_types, STR(" ")));
+      strbuf_append(ctx, out, STR("] "));
+      strbuf_append(ctx, out, method->return_type);
+      strbuf_append(ctx, out, STR("]"));
+    }
+    strbuf_append(ctx, out, STR("]"));
+  } else if (key == GEN_CLASS_EXPOSES) {
+    if (gc->exposes.size == 0) {
+      strbuf_append(ctx, out, STR(" {}"));
+      return;
+    }
+    for (int idx = 0; idx < gc->exposes.size; idx++) {
+      const scs_gen_class_expose *expose = &gc->exposes.items[idx];
+      if (idx == 0) {
+        strbuf_append(ctx, out, STR(" {"));
+      } else {
+        strbuf_append(ctx, out, STR("\n"));
+        strbuf_append(ctx, out, entry_indentation);
+      }
+      strbuf_append(ctx, out, expose->field_name);
+      strbuf_append(ctx, out, STR(" {"));
+      if (expose->getter.len > 0) {
+        strbuf_append(ctx, out, STR(":get "));
+        strbuf_append(ctx, out, expose->getter);
+      }
+      if (expose->setter.len > 0) {
+        if (expose->getter.len > 0) {
+          strbuf_append(ctx, out, STR(" "));
+        }
+        strbuf_append(ctx, out, STR(":set "));
+        strbuf_append(ctx, out, expose->setter);
+      }
+      strbuf_append(ctx, out, STR("}"));
+    }
+    strbuf_append(ctx, out, STR("}"));
+  } else if (key == GEN_CLASS_EXPOSES_METHODS) {
+    if (gc->exposes_methods.size == 0) {
+      strbuf_append(ctx, out, STR(" {}"));
+      return;
+    }
+    for (int idx = 0; idx < gc->exposes_methods.size; idx++) {
+      const scs_gen_class_exposes_method *itm = &gc->exposes_methods.items[idx];
+      if (idx == 0) {
+        strbuf_append(ctx, out, STR(" {"));
+      } else {
+        strbuf_append(ctx, out, STR("\n"));
+        strbuf_append(ctx, out, entry_indentation);
+      }
+      strbuf_append(ctx, out, itm->super_method_name);
+      strbuf_append(ctx, out, STR(" "));
+      strbuf_append(ctx, out, itm->exposed_name);
+    }
+    strbuf_append(ctx, out, STR("}"));
+  }
+}
+
+/* prints the ns form from scratch */
+static scs_str format_ns(scs_ctx *ctx, const scs_ns *ns) {
+  scs_strbuf out = {NULL, 0, 0};
+  strbuf_append(ctx, &out, STR("(ns "));
+  strbuf_append(ctx, &out, ns->ns_symbol);
+
+  int num_require_macros = ns->require_macros != NULL ? ns->require_macros->size : 0;
+  int num_requires = ns->
+                       requires !=
+                     NULL ? ns->
+                              requires
+                              ->size : 0;
+  int num_imports = ns->imports != NULL ? ns->imports->size : 0;
+
+  scs_str comment_outside_ns_form2 = EMPTY_STR;
+  bool has_gen_class = ns->gen_class != NULL;
+  bool imports_is_last_main_form = num_imports > 0 && !has_gen_class;
+  bool require_is_last_main_form = num_requires > 0 && !imports_is_last_main_form && !has_gen_class;
+  bool require_macros_is_last_main_form =
+      num_require_macros > 0 && num_requires == 0 && num_imports == 0 && !has_gen_class;
+  bool refer_clojure_is_last_main_form = ns->refer_clojure != NULL && num_require_macros == 0 &&
+                                         num_requires == 0 && num_imports == 0 && !has_gen_class;
+  bool trailing_parens_are_printed = false;
+
+  if (ns->has_docstring) {
+    strbuf_append(ctx, &out, STR("\n  \""));
+    strbuf_append(ctx, &out, ns->docstring);
+    strbuf_append(ctx, &out, STR("\""));
+  }
+
+  if (ns->ns_metadata != NULL && ns->ns_metadata->size > 0) {
+    int num_metadata_itms = ns->ns_metadata->size;
+    strbuf_append(ctx, &out, STR("\n  {"));
+    for (int idx = 0; idx < num_metadata_itms; idx++) {
+      strbuf_append(ctx, &out, ns->ns_metadata->items[idx].key);
+      strbuf_append(ctx, &out, STR(" "));
+      strbuf_append(ctx, &out, ns->ns_metadata->items[idx].value);
+      if (idx + 1 != num_metadata_itms) {
+        strbuf_append(ctx, &out, STR("\n   "));
+      }
+    }
+    strbuf_append(ctx, &out, STR("}"));
+  }
+
+  if (ns->refer_clojure != NULL) {
+    strbuf_append(ctx, &out, format_refer_clojure(ctx, ns));
+
+    if (ns->refer_clojure_comment_after.len > 0) {
+      if (refer_clojure_is_last_main_form) {
+        comment_outside_ns_form2 = ns->refer_clojure_comment_after;
+      } else {
+        strbuf_append(ctx, &out, STR(" "));
+        strbuf_append(ctx, &out, ns->refer_clojure_comment_after);
+      }
+    }
+  }
+
+  if (num_require_macros > 0) {
+    scs_ns_require_list cljs_platform_require_macros =
+        filter_requires_on_platform(ctx, ns->require_macros, STR(":cljs"));
+    bool wrap_require_macros_with_reader_conditional =
+        cljs_platform_require_macros.size == num_require_macros;
+    scs_str rm_last_line_comment_after = EMPTY_STR;
+
+    scs_str rm_indentation = STR("   ");
+    if (wrap_require_macros_with_reader_conditional) {
+      strbuf_append(ctx, &out, STR("\n  #?(:cljs\n"));
+      print_comments_above(ctx, &out, ns->require_macros_comments_above, STR("     "));
+      strbuf_append(ctx, &out, STR("     (:require-macros\n"));
+      rm_indentation = STR("      ");
+    } else {
+      strbuf_append(ctx, &out, STR("\n"));
+      print_comments_above(ctx, &out, ns->require_macros_comments_above, STR("  "));
+      strbuf_append(ctx, &out, STR("  (:require-macros\n"));
+    }
+
+    for (int rm_idx = 0; rm_idx < num_require_macros; rm_idx++) {
+      const scs_ns_require *rm = &ns->require_macros->items[rm_idx];
+      bool is_last_require_macro_line = rm_idx + 1 == num_require_macros;
+      strbuf_append(ctx, &out, format_require_line(ctx, rm, rm_indentation, false));
+
+      if (rm->comment_after.len > 0) {
+        if (is_last_require_macro_line) {
+          rm_last_line_comment_after = rm->comment_after;
+        } else {
+          strbuf_append(ctx, &out, STR(" "));
+          strbuf_append(ctx, &out, rm->comment_after);
+        }
+      }
+
+      if (!is_last_require_macro_line) {
+        strbuf_append(ctx, &out, STR("\n"));
+      }
+    }
+
+    if (!require_macros_is_last_main_form && !wrap_require_macros_with_reader_conditional) {
+      strbuf_append(ctx, &out, STR(")"));
+    } else if (!require_macros_is_last_main_form && wrap_require_macros_with_reader_conditional) {
+      strbuf_append(ctx, &out, STR("))"));
+    } else if (require_macros_is_last_main_form && !wrap_require_macros_with_reader_conditional) {
+      strbuf_append(ctx, &out, STR("))"));
+      trailing_parens_are_printed = true;
+    } else {
+      strbuf_append(ctx, &out, STR(")))"));
+      trailing_parens_are_printed = true;
+    }
+
+    if (rm_last_line_comment_after.len > 0) {
+      strbuf_append(ctx, &out, STR(" "));
+      strbuf_append(ctx, &out, rm_last_line_comment_after);
+    }
+  }
+
+  if (num_requires > 0) {
+    scs_str close_require_paren_trail = STR(")");
+    bool last_require_has_comment = false;
+    scs_str last_require_comment = EMPTY_STR;
+    scs_str_list req_platform_strs = require_platforms(ctx, ns->requires);
+    scs_str_list req_platforms = get_platforms_from_array(ctx, &req_platform_strs);
+    int num_platforms = req_platforms.size;
+
+    bool all_requires_under_one_platform = false;
+    if (num_platforms == 1) {
+      scs_ns_require_list one_platform_requires =
+          filter_requires_on_platform(ctx, ns->requires, req_platforms.items[0]);
+      if (num_requires == one_platform_requires.size) {
+        all_requires_under_one_platform = true;
+      }
+    }
+
+    scs_str require_line_indentation = STR("   ");
+    if (all_requires_under_one_platform) {
+      strbuf_append(ctx, &out, STR("\n  #?("));
+      strbuf_append(ctx, &out, req_platforms.items[0]);
+
+      if (ns->require_comments_above != NULL && ns->require_comments_above->size > 0) {
+        strbuf_append(ctx, &out, STR("\n     "));
+        strbuf_append(ctx, &out, str_join(ctx, ns->require_comments_above, STR("\n     ")));
+      }
+
+      strbuf_append(ctx, &out, STR("\n     (:require"));
+      if (ns->require_comment_after.len > 0) {
+        strbuf_append(ctx, &out, STR(" "));
+        strbuf_append(ctx, &out, ns->require_comment_after);
+      }
+      strbuf_append(ctx, &out, STR("\n"));
+      require_line_indentation = STR("      ");
+    } else {
+      if (ns->require_comments_above != NULL && ns->require_comments_above->size > 0) {
+        strbuf_append(ctx, &out, STR("\n  "));
+        strbuf_append(ctx, &out, str_join(ctx, ns->require_comments_above, STR("\n  ")));
+      }
+      strbuf_append(ctx, &out, STR("\n  (:require\n"));
+    }
+
+    for (int requires_idx = 0; requires_idx < num_requires; requires_idx++) {
+      const scs_ns_require *req = &ns->
+                                     requires
+                                      ->items[requires_idx];
+      bool is_last_require1 = requires_idx + 1 == num_requires;
+
+      if (req->platform.len == 0 || all_requires_under_one_platform) {
+        strbuf_append(ctx, &out, format_require_line(ctx, req, require_line_indentation, false));
+
+        if (req->comment_after.len > 0 && !is_last_require1) {
+          strbuf_append(ctx, &out, STR(" "));
+          strbuf_append(ctx, &out, req->comment_after);
+          strbuf_append(ctx, &out, STR("\n"));
+        } else if (is_last_require1 && req->comment_after.len > 0 && require_is_last_main_form &&
+                   !all_requires_under_one_platform) {
+          close_require_paren_trail = str_concat(ctx, STR(")) "), req->comment_after);
+          trailing_parens_are_printed = true;
+        } else if (is_last_require1 && req->comment_after.len > 0 &&
+                   all_requires_under_one_platform) {
+          last_require_comment = req->comment_after;
+          last_require_has_comment = true;
+        } else if (is_last_require1 && req->comment_after.len > 0) {
+          close_require_paren_trail = str_concat(ctx, STR(") "), req->comment_after);
+        } else if (is_last_require1) {
+          close_require_paren_trail = STR(")");
+        } else {
+          strbuf_append(ctx, &out, STR("\n"));
+        }
+      }
+    }
+
+    bool require_block_has_reader_conditionals = num_platforms > 0;
+    bool use_standard_reader_conditional = only_one_require_per_platform(ctx, ns->requires);
+
+    if (!all_requires_under_one_platform) {
+      if (use_standard_reader_conditional) {
+        /* standard reader conditional #?( */
+        for (int platform_idx = 0; platform_idx < num_platforms; platform_idx++) {
+          scs_str platform = req_platforms.items[platform_idx];
+
+          if (platform_idx == 0) {
+            strbuf_trim(&out);
+            strbuf_append(ctx, &out, STR("\n   #?("));
+            strbuf_append(ctx, &out, platform);
+            strbuf_append(ctx, &out, STR(" "));
+          } else {
+            strbuf_append(ctx, &out, STR("\n      "));
+            strbuf_append(ctx, &out, platform);
+            strbuf_append(ctx, &out, STR(" "));
+          }
+
+          /* only the requires for this platform */
+          scs_ns_require_list platform_requires =
+              filter_requires_on_platform(ctx, ns->requires, platform);
+          strbuf_append(ctx, &out,
+                        format_require_line(ctx, &platform_requires.items[0], EMPTY_STR, true));
+          /* FIXME: comments before and after are not printed here */
+        }
+      } else {
+        /* splicing reader conditional #?@( */
+        for (int platform_idx = 0; platform_idx < num_platforms; platform_idx++) {
+          scs_str platform = req_platforms.items[platform_idx];
+          bool is_last_platform = platform_idx + 1 == num_platforms;
+
+          if (platform_idx == 0) {
+            strbuf_trim(&out);
+            strbuf_append(ctx, &out, STR("\n   #?@("));
+            strbuf_append(ctx, &out, platform);
+            strbuf_append(ctx, &out, STR("\n       ["));
+          } else {
+            strbuf_append(ctx, &out, STR("\n\n       "));
+            strbuf_append(ctx, &out, platform);
+            strbuf_append(ctx, &out, STR("\n       ["));
+          }
+
+          scs_ns_require_list platform_requires =
+              filter_requires_on_platform(ctx, ns->requires, platform);
+          int num_filtered_reqs = platform_requires.size;
+          bool printed_first_req_line = false;
+          bool print_platform_closing_bracket = true;
+          for (int req_idx2 = 0; req_idx2 < num_filtered_reqs; req_idx2++) {
+            const scs_ns_require *req = &platform_requires.items[req_idx2];
+            bool is_last_require_for_this_platform = req_idx2 + 1 == num_filtered_reqs;
+
+            if (printed_first_req_line) {
+              strbuf_append(ctx, &out, format_require_line(ctx, req, STR("        "), false));
+            } else {
+              printed_first_req_line = true;
+              strbuf_append(ctx, &out, format_require_line(ctx, req, EMPTY_STR, false));
+            }
+
+            if (req->comment_after.len > 0 && !is_last_require_for_this_platform) {
+              strbuf_append(ctx, &out, STR(" "));
+              strbuf_append(ctx, &out, req->comment_after);
+              strbuf_append(ctx, &out, STR("\n"));
+            } else if (req->comment_after.len > 0 && is_last_require_for_this_platform &&
+                       !is_last_platform) {
+              strbuf_append(ctx, &out, STR("] "));
+              strbuf_append(ctx, &out, req->comment_after);
+              print_platform_closing_bracket = false;
+            } else if (req->comment_after.len > 0 && is_last_require_for_this_platform &&
+                       (is_last_platform || require_is_last_main_form)) {
+              last_require_has_comment = true;
+              last_require_comment = req->comment_after;
+            } else if (is_last_require_for_this_platform && req->comment_after.len > 0) {
+              close_require_paren_trail = str_concat(ctx, STR(") "), req->comment_after);
+            } else if (is_last_require_for_this_platform) {
+              close_require_paren_trail = STR("]");
+            } else {
+              strbuf_append(ctx, &out, STR("\n"));
+            }
+          }
+
+          if (print_platform_closing_bracket) {
+            strbuf_append(ctx, &out, STR("]"));
+          }
+        }
+      }
+    }
+
+    /* close_require_paren_trail can be one of six options:
+     * - )             no reader conditional, no comment on the last item, not the last main form
+     * - ) <comment>   no reader conditional, comment on the last item, not the last main form
+     * - ))            reader conditional, no comment on the last item, not the last main form
+     * - )) <comment>  reader conditional, comment on the last item, not the last main form
+     * - )))           reader conditional, no comment on the last item, :require is the last main
+     * form
+     * - ))) <comment> reader conditional, comment on the last item, :require is the last main form
+     */
+    if (!require_block_has_reader_conditionals && !last_require_has_comment &&
+        !require_is_last_main_form) {
+      close_require_paren_trail = STR(")");
+    } else if (!require_block_has_reader_conditionals && last_require_has_comment &&
+               !require_is_last_main_form) {
+      close_require_paren_trail = str_concat(ctx, STR(") "), last_require_comment);
+    } else if (require_block_has_reader_conditionals && !last_require_has_comment &&
+               !require_is_last_main_form) {
+      close_require_paren_trail = STR("))");
+    } else if (require_block_has_reader_conditionals && last_require_has_comment &&
+               !require_is_last_main_form) {
+      close_require_paren_trail = str_concat(ctx, STR(")) "), last_require_comment);
+    } else if (require_block_has_reader_conditionals && !last_require_has_comment &&
+               require_is_last_main_form) {
+      close_require_paren_trail = STR(")))");
+      trailing_parens_are_printed = true;
+    } else if (require_block_has_reader_conditionals && last_require_has_comment &&
+               require_is_last_main_form) {
+      close_require_paren_trail = str_concat(ctx, STR("))) "), last_require_comment);
+      trailing_parens_are_printed = true;
+    }
+
+    strbuf_trim(&out);
+    strbuf_append(ctx, &out, close_require_paren_trail);
+  } /* end :require printing */
+
+  if (num_imports > 0) {
+    scs_ns_import_list non_platform_specific_imports =
+        filter_imports_on_platform(ctx, ns->imports, EMPTY_STR);
+    int num_non_platform_specific_imports = non_platform_specific_imports.size;
+    scs_str_list import_platform_strs = import_platforms(ctx, ns->imports);
+    scs_str_list import_platform_list = get_platforms_from_array(ctx, &import_platform_strs);
+    int num_import_platforms = import_platform_list.size;
+
+    scs_str last_import_line_comment_after = EMPTY_STR;
+    bool is_import_keyword_printed = false;
+
+    for (int imports_idx = 0; imports_idx < num_non_platform_specific_imports; imports_idx++) {
+      if (!is_import_keyword_printed) {
+        strbuf_append(ctx, &out, STR("\n  (:import\n"));
+        is_import_keyword_printed = true;
+      }
+
+      const scs_ns_import *imp = &non_platform_specific_imports.items[imports_idx];
+      bool is_last_import = imports_idx + 1 == num_non_platform_specific_imports;
+
+      strbuf_append(ctx, &out, STR("   ("));
+      strbuf_append(ctx, &out, imp->package);
+      for (int class_name_idx = 0; class_name_idx < imp->classes.size; class_name_idx++) {
+        strbuf_append(ctx, &out, STR(" "));
+        strbuf_append(ctx, &out, imp->classes.items[class_name_idx]);
+      }
+      strbuf_append(ctx, &out, STR(")"));
+
+      if (imp->comment_after.len > 0) {
+        strbuf_append(ctx, &out, STR(" "));
+        strbuf_append(ctx, &out, imp->comment_after);
+      }
+      if (!is_last_import) {
+        strbuf_append(ctx, &out, STR("\n"));
+      }
+    }
+
+    bool is_first_platform = true;
+    bool import_section_has_reader_conditionals = num_import_platforms > 0;
+    bool place_reader_conditional_outside_of_import =
+        num_import_platforms == 1 && num_non_platform_specific_imports == 0;
+
+    for (int platform_idx = 0; platform_idx < num_import_platforms; platform_idx++) {
+      scs_str platform_str = import_platform_list.items[platform_idx];
+
+      if (place_reader_conditional_outside_of_import) {
+        strbuf_append(ctx, &out, STR("\n  #?("));
+        strbuf_append(ctx, &out, platform_str);
+        strbuf_append(ctx, &out, STR("\n     (:import\n      "));
+        is_import_keyword_printed = true;
+      } else if (is_first_platform) {
+        if (!is_import_keyword_printed) {
+          strbuf_append(ctx, &out, STR("\n  (:import"));
+          is_import_keyword_printed = true;
+        }
+        strbuf_append(ctx, &out, STR("\n   #?@("));
+        strbuf_append(ctx, &out, platform_str);
+        strbuf_append(ctx, &out, STR("\n       ["));
+        is_first_platform = false;
+      } else {
+        strbuf_append(ctx, &out, STR("\n\n       "));
+        strbuf_append(ctx, &out, platform_str);
+        strbuf_append(ctx, &out, STR("\n       ["));
+      }
+
+      scs_ns_import_list imports_for_this_platform =
+          filter_imports_on_platform(ctx, ns->imports, platform_str);
+      int num_imports2 = imports_for_this_platform.size;
+      for (int idx2 = 0; idx2 < num_imports2; idx2++) {
+        const scs_ns_import *imp = &imports_for_this_platform.items[idx2];
+        bool is_last_import2 = idx2 + 1 == num_imports2;
+
+        strbuf_append(ctx, &out, STR("("));
+        strbuf_append(ctx, &out, imp->package);
+        strbuf_append(ctx, &out, STR(" "));
+        strbuf_append(ctx, &out, str_join(ctx, &imp->classes, STR(" ")));
+        strbuf_append(ctx, &out, STR(")"));
+
+        if (is_last_import2) {
+          if (!place_reader_conditional_outside_of_import) {
+            strbuf_append(ctx, &out, STR("]"));
+          }
+          if (imp->comment_after.len > 0) {
+            last_import_line_comment_after = imp->comment_after;
+          }
+        } else {
+          if (imp->comment_after.len > 0) {
+            strbuf_append(ctx, &out, STR(" "));
+            strbuf_append(ctx, &out, imp->comment_after);
+          }
+          if (place_reader_conditional_outside_of_import) {
+            strbuf_append(ctx, &out, STR("\n      "));
+          } else {
+            strbuf_append(ctx, &out, STR("\n        "));
+          }
+        }
+      }
+    }
+
+    scs_str close_import_paren_trail = STR(")");
+    if (imports_is_last_main_form && import_section_has_reader_conditionals) {
+      close_import_paren_trail = STR(")))");
+      trailing_parens_are_printed = true;
+    } else if (imports_is_last_main_form && !import_section_has_reader_conditionals) {
+      close_import_paren_trail = STR("))");
+      trailing_parens_are_printed = true;
+    }
+    strbuf_append(ctx, &out, close_import_paren_trail);
+
+    if (last_import_line_comment_after.len > 0) {
+      strbuf_append(ctx, &out, STR(" "));
+      strbuf_append(ctx, &out, last_import_line_comment_after);
+    }
+  } /* end :import section */
+
+  if (has_gen_class) {
+    const scs_ns_gen_class *gc = ns->gen_class;
+    int gen_class_indentation_level = 2;
+    strbuf_append(ctx, &out, STR("\n"));
+
+    bool is_gen_class_behind_reader_conditional = str_eq_cstr(gc->platform, ":clj");
+    if (is_gen_class_behind_reader_conditional) {
+      strbuf_append(ctx, &out, STR("  #?(:clj\n"));
+      gen_class_indentation_level = 5;
+    }
+
+    scs_str indentation_str = repeat_string(ctx, STR(" "), gen_class_indentation_level);
+    print_comments_above(ctx, &out, gc->comments_above, indentation_str);
+    strbuf_append(ctx, &out, indentation_str);
+    strbuf_append(ctx, &out, STR("(:gen-class"));
+
+    scs_str comment_after_gen_class = EMPTY_STR;
+
+    if (gc->is_empty) {
+      comment_after_gen_class = gc->comment_after;
+    } else {
+      if (gc->comment_after.len > 0) {
+        strbuf_append(ctx, &out, STR(" "));
+        strbuf_append(ctx, &out, gc->comment_after);
+      }
+
+      int gen_class_value_indentation_level = gen_class_indentation_level + 1;
+      scs_str indentation_str2 = repeat_string(ctx, STR(" "), gen_class_value_indentation_level);
+
+      /* print the :gen-class keys in the order of the clojure.core.genclass documentation */
+      for (int key = 0; key < GEN_CLASS_NUM_KEYS; key++) {
+        const scs_gen_class_entry *entry = &gc->entries[key];
+        if (!entry->present) {
+          continue;
+        }
+
+        /* print the comment from the previous line if necessary */
+        if (comment_after_gen_class.len > 0) {
+          strbuf_append(ctx, &out, STR(" "));
+          strbuf_append(ctx, &out, comment_after_gen_class);
+          comment_after_gen_class = EMPTY_STR;
+        }
+
+        strbuf_append(ctx, &out, STR("\n"));
+        print_comments_above(ctx, &out, entry->comments_above, indentation_str2);
+        strbuf_append(ctx, &out, indentation_str2);
+        strbuf_append(ctx, &out, STR(":"));
+        strbuf_append(ctx, &out, str_from_cstr(gen_class_key_names[key]));
+
+        if (key == GEN_CLASS_IMPLEMENTS) {
+          int num_interfaces = entry->has_value ? gc->implements.size : 0;
+          for (int interface_idx = 0; interface_idx < num_interfaces; interface_idx++) {
+            strbuf_append(ctx, &out, interface_idx == 0 ? STR(" [") : STR(" "));
+            strbuf_append(ctx, &out, gc->implements.items[interface_idx].symbol);
+          }
+          if (num_interfaces > 0) {
+            strbuf_append(ctx, &out, STR("]"));
+          }
+        } else if (key == GEN_CLASS_CONSTRUCTORS || key == GEN_CLASS_METHODS ||
+                   key == GEN_CLASS_EXPOSES || key == GEN_CLASS_EXPOSES_METHODS) {
+          if (!entry->has_value) {
+            scs_str msg =
+                str_concat3(ctx, STR(":gen-class :"), str_from_cstr(gen_class_key_names[key]),
+                            STR(" is missing its value."));
+            scs_throw(ctx, msg.data);
+          }
+          format_gen_class_structured_value(ctx, &out, key, gc, gen_class_value_indentation_level);
+        } else if (entry->has_value) {
+          if (entry->metadata.len > 0) {
+            strbuf_append(ctx, &out, STR(" "));
+            strbuf_append(ctx, &out, entry->metadata);
+          }
+          strbuf_append(ctx, &out, STR(" "));
+          if (is_gen_class_boolean_key(key)) {
+            strbuf_append(ctx, &out, entry->bool_value ? STR("true") : STR("false"));
+          } else {
+            strbuf_append(ctx, &out, entry->value);
+          }
+        }
+        /* a key without a value prints just the key */
+
+        if (entry->comment_after.len > 0) {
+          comment_after_gen_class = entry->comment_after;
+        }
+      }
+    }
+
+    if (!is_gen_class_behind_reader_conditional && comment_after_gen_class.len == 0) {
+      strbuf_append(ctx, &out, STR("))"));
+    } else if (is_gen_class_behind_reader_conditional && comment_after_gen_class.len == 0) {
+      strbuf_append(ctx, &out, STR(")))"));
+    } else if (!is_gen_class_behind_reader_conditional) {
+      strbuf_append(ctx, &out, STR(")) "));
+      strbuf_append(ctx, &out, comment_after_gen_class);
+    } else {
+      strbuf_append(ctx, &out, STR("))) "));
+      strbuf_append(ctx, &out, comment_after_gen_class);
+    }
+    trailing_parens_are_printed = true;
+  } /* end :gen-class section */
+
+  if (!trailing_parens_are_printed) {
+    strbuf_append(ctx, &out, STR(")"));
+  }
+
+  if (comment_outside_ns_form2.len > 0) {
+    strbuf_append(ctx, &out, STR(" "));
+    strbuf_append(ctx, &out, comment_outside_ns_form2);
+  }
+
+  return strbuf_to_str(&out);
+}
+
+/* -----------------------------------------------------------------------------
+ * Format
+ */
+
+/* The line of output being built. Its length in code points is tracked as text
+ * is appended so that column positions do not require rescanning the line. */
+typedef struct scs_line {
+  scs_strbuf buf;
+  int num_chars;
+} scs_line;
+
+static void line_append(scs_ctx *ctx, scs_line *line, scs_str s) {
+  strbuf_append(ctx, &line->buf, s);
+  line->num_chars += str_len(s);
+}
+
+static void line_set(scs_ctx *ctx, scs_line *line, scs_str s) {
+  line->buf.len = 0;
+  line->num_chars = 0;
+  line_append(ctx, line, s);
+}
+
+static scs_str line_str(const scs_line *line) {
+  return strbuf_to_str(&line->buf);
+}
+
+/* removes trailing spaces and commas (which are single-byte characters) */
+static void line_remove_trailing_whitespace(scs_line *line) {
+  scs_str trimmed = remove_trailing_whitespace(line_str(line));
+  line->num_chars -= line->buf.len - trimmed.len;
+  line->buf.len = trimmed.len;
+}
+
+typedef struct scs_format_output {
+  bool file_was_ignored;
+  scs_str out;
+} scs_format_output;
+
+/* Prints the flat list of nodes, applying the formatting rules, and replaces
+ * the ns form with the one printed by format_ns(). */
+static scs_str format_nodes(scs_ctx *ctx, scs_node_list *nodes_arr, const scs_ns *parsed_ns) {
+  int num_nodes = nodes_arr->size;
+  bool has_parsed_ns_form = parsed_ns->ns_symbol.len > 0;
+
+  int paren_nesting_depth = 0;
+  scs_strbuf out_txt = {NULL, 0, 0};
+  bool output_txt_contains_chars = false;
+  scs_line line_txt = {{NULL, 0, 0}, 0};
+  int line_idx = 0;
+  bool inside_ns_form = false;
+  int line_idx_of_closing_ns_form = -1;
+  int ns_start_string_idx = -1;
+  int ns_end_string_idx = -1;
+  int ignore_nodes_start_id = -1;
+  int ignore_nodes_end_id = -1;
+  bool inside_the_ignore_zone = false;
+
+  scs_node_list paren_stack = {NULL, 0, 0};
+  scs_node_list nodes_we_have_printed_on_this_line = {NULL, 0, 0};
+
+  int col_idx = 0;
+  for (int idx = 0; idx < num_nodes; idx++) {
+    scs_node *node = nodes_arr->items[idx];
+
+    if (ignore_nodes_start_id > 0 && node->id == ignore_nodes_start_id) {
+      inside_the_ignore_zone = true;
+
+      /* dump the current line when the ignore zone starts */
+      strbuf_append(ctx, &out_txt, line_str(&line_txt));
+      line_set(ctx, &line_txt, EMPTY_STR);
+    }
+
+    if (inside_the_ignore_zone) {
+      if (node->text.len > 0) {
+        strbuf_append(ctx, &out_txt, node->text);
+      }
+      if (node->id == ignore_nodes_end_id) {
+        ignore_nodes_start_id = -1;
+        ignore_nodes_end_id = -1;
+        inside_the_ignore_zone = false;
+      }
+      continue;
+    }
+
+    /* a .tag node's text does not include its leading # */
+    if (is_tag_node(node)) {
+      node->text = STR("#");
+    }
+
+    /* record the original column indexes for the first line */
+    if (idx == 0) {
+      record_original_col_indexes(nodes_arr, idx);
+    }
+
+    if (ns_start_string_idx == -1 && paren_nesting_depth == 1 && has_parsed_ns_form &&
+        is_ns_node(node)) {
+      inside_ns_form = true;
+      ns_start_string_idx = str_len(strbuf_to_str(&out_txt)) + line_txt.num_chars;
+    }
+
+    scs_node *next_text_node = find_next_node_with_text(nodes_arr, idx + 1);
+    bool is_last_node = idx + 1 >= num_nodes;
+    bool current_node_is_whitespace = is_whitespace_node(node);
+    bool current_node_is_newline = is_newline_node(node);
+
+    bool skip_printing_this_node = false;
+
+    if (is_standard_clj_ignore_keyword(node) && idx > 1) {
+      scs_node *prev_node1 = find_prev_node_with_text(nodes_arr, idx, node->id);
+      scs_node *prev_node2 = NULL;
+      if (prev_node1) {
+        prev_node2 = find_prev_node_with_text(nodes_arr, idx, prev_node1->id);
+      }
+
+      bool is_discard_map = node_name_eq(prev_node1, ".open") && node_text_is(prev_node1, "{") &&
+                            prev_node2 && is_discard_node(prev_node2);
+
+      if (is_discard_node(prev_node1) ||
+          (prev_node1 && is_whitespace_node(prev_node1) && is_discard_node(prev_node2))) {
+        /* look forward to find the next node with text */
+        scs_node *next_ignore_node = find_next_non_whitespace_node(nodes_arr, idx + 1);
+        if (next_ignore_node != NULL) {
+          if (next_ignore_node->children.size > 0) {
+            /* parens, brackets, or something else with children: find the closing node */
+            scs_node *closing_node = node_list_last(&next_ignore_node->children);
+            ignore_nodes_start_id = next_ignore_node->id;
+            ignore_nodes_end_id = closing_node->id;
+          } else {
+            /* a node without children: just do not format it */
+            scs_node *next_immediate_node = nodes_arr->items[idx + 1];
+            ignore_nodes_start_id = next_immediate_node->id;
+            ignore_nodes_end_id = next_ignore_node->id;
+          }
+        }
+      } else if (is_discard_map) {
+        /* find the opening { and closing } for this form */
+        scs_node *opening_brace_node =
+            find_prev_node_with_predicate(nodes_arr, idx, is_opening_brace_node);
+        if (opening_brace_node != NULL) {
+          int closing_brace_node_id = opening_brace_node->children.items[2]->id;
+
+          scs_node *start_ignore_node = find_next_node_with_predicate_after_specific_node(
+              nodes_arr, idx, always_true, closing_brace_node_id);
+          scs_node *first_node_inside_ignore_zone = NULL;
+          if (start_ignore_node != NULL) {
+            first_node_inside_ignore_zone = find_next_node_with_predicate_after_specific_node(
+                nodes_arr, idx, always_true, start_ignore_node->id);
+          }
+
+          if (first_node_inside_ignore_zone != NULL) {
+            if (first_node_inside_ignore_zone->children.size > 0) {
+              scs_node *closing_node = node_list_last(&first_node_inside_ignore_zone->children);
+              ignore_nodes_start_id = start_ignore_node->id;
+              ignore_nodes_end_id = closing_node->id;
+            } else {
+              ignore_nodes_start_id = start_ignore_node->id;
+              ignore_nodes_end_id = first_node_inside_ignore_zone->id;
+            }
+          }
+        }
+      }
+    }
+
+    if (is_paren_opener(node)) {
+      /* this opener may belong to the opening line of the current paren stack
+       * before it becomes the new top of the stack */
+      scs_node *top_of_the_paren_stack = node_list_peek(&paren_stack, 0);
+      if (top_of_the_paren_stack) {
+        bool on_opening_line_of_paren_stack =
+            line_idx == top_of_the_paren_stack->paren_opener_line_idx;
+        if (on_opening_line_of_paren_stack) {
+          node->col_idx = col_idx;
+          node->line_idx = line_idx;
+          node_list_push(ctx, &top_of_the_paren_stack->opening_line_nodes, node);
+        }
+      }
+
+      paren_nesting_depth++;
+
+      /* attach some extra information to this node and push it onto the paren stack */
+      node->col_idx = col_idx;
+      node->next_with_text = next_text_node;
+      node->next_with_text_skipping_meta = find_next_text_node_skipping_meta(nodes_arr, idx + 1);
+      node->paren_opener_line_idx = line_idx;
+      /* the nodes on the first line of this form, used to decide whether Rule 3 applies */
+      node->opening_line_nodes.size = 0;
+      node->rule3_active = false;
+      node->rule3_num_spaces = 0;
+      node->rule3_search_complete = false;
+      node_list_push(ctx, &paren_stack, node);
+
+      /* remove whitespace after an opener */
+      if (next_text_node && is_whitespace_node(next_text_node)) {
+        next_text_node->text = EMPTY_STR;
+      }
+    } else if (is_paren_closer(node)) {
+      paren_nesting_depth--;
+      node_list_pop(&paren_stack);
+
+      /* flag the end of the ns form */
+      if (inside_ns_form && paren_nesting_depth == 0) {
+        inside_ns_form = false;
+        ns_end_string_idx = str_len(strbuf_to_str(&out_txt)) + line_txt.num_chars;
+        line_idx_of_closing_ns_form = line_idx;
+      }
+    }
+
+    /* add nodes to the top of the paren stack if we are on its opening line */
+    scs_node *top_of_the_paren_stack = node_list_peek(&paren_stack, 0);
+    if (top_of_the_paren_stack && node_contains_text(node)) {
+      bool on_opening_line_of_paren_stack =
+          line_idx == top_of_the_paren_stack->paren_opener_line_idx;
+      if (on_opening_line_of_paren_stack) {
+        node->col_idx = col_idx;
+        node->line_idx = line_idx;
+        node_list_push(ctx, &top_of_the_paren_stack->opening_line_nodes, node);
+      }
+    }
+
+    /* remove whitespace before a closer */
+    if (current_node_is_whitespace && !current_node_is_newline && is_paren_closer(next_text_node)) {
+      skip_printing_this_node = true;
+    }
+
+    /* do not print a comma at the end of a line */
+    if (current_node_is_whitespace && !current_node_is_newline && next_text_node &&
+        is_comment_node(next_text_node)) {
+      node->text = str_replace_all(ctx, node->text, STR(","), EMPTY_STR);
+    }
+
+    /* If we are inside a paren stack and hit a newline, look forward to see if
+     * the closing parens can be slurped up onto the current line. */
+    if (paren_stack.size > 0 && !inside_ns_form) {
+      bool is_comment_followed_by_newline =
+          is_comment_node(node) && next_text_node && is_newline_node(next_text_node);
+      bool is_newline = is_newline_node(node);
+      bool has_commas_after_newline2 = has_commas_after_newline(node) ||
+                                       (next_text_node && has_commas_after_newline(next_text_node));
+
+      bool look_forward_to_slurp_nodes = false;
+      if (has_commas_after_newline2) {
+        look_forward_to_slurp_nodes = false;
+      } else if (is_comment_followed_by_newline) {
+        look_forward_to_slurp_nodes = true;
+      } else if (is_newline) {
+        look_forward_to_slurp_nodes = true;
+      }
+
+      if (look_forward_to_slurp_nodes) {
+        scs_node_list paren_trail_closers = find_forward_closing_parens(ctx, nodes_arr, idx + 1);
+
+        /* if a whitespace node was just printed, remove it and re-print it after the closers */
+        scs_node *last_node_we_printed = node_list_last(&nodes_we_have_printed_on_this_line);
+        bool line_txt_has_been_right_trimmed = false;
+        if (last_node_we_printed && is_whitespace_node(last_node_we_printed)) {
+          line_remove_trailing_whitespace(&line_txt);
+          line_txt_has_been_right_trimmed = true;
+        }
+
+        for (int closer_idx = 0; closer_idx < paren_trail_closers.size; closer_idx++) {
+          scs_node *paren_trail_closer_node = paren_trail_closers.items[closer_idx];
+          if (is_paren_closer(paren_trail_closer_node)) {
+            /* the current line is adjusted here without updating
+             * nodes_we_have_printed_on_this_line, because a closer can never be
+             * a Rule 3 alignment node */
+            line_append(ctx, &line_txt, paren_trail_closer_node->text);
+            paren_trail_closer_node->text = EMPTY_STR;
+            paren_trail_closer_node->was_slurped_up = true;
+            paren_nesting_depth--;
+            node_list_pop(&paren_stack);
+          }
+        }
+
+        if (line_txt_has_been_right_trimmed) {
+          line_append(ctx, &line_txt, last_node_we_printed->text);
+        }
+      }
+    }
+
+    if (current_node_is_newline) {
+      /* record the original column indexes for the next line */
+      record_original_col_indexes(nodes_arr, idx);
+
+      int num_spaces_on_next_line = num_spaces_after_newline(node);
+
+      /* has everything on the next line already been slurped up? */
+      bool all_next_line_nodes_were_slurped_up =
+          are_forward_nodes_already_slurped(nodes_arr, idx + 1);
+
+      bool next_line_contains_only_one_comment = is_next_line_a_comment_line(nodes_arr, idx + 1);
+      int next_line_comment_col_idx = -1;
+      if (next_line_contains_only_one_comment) {
+        next_line_comment_col_idx = num_spaces_on_next_line;
+      }
+
+      bool is_double_newline = str_includes(node->text, STR("\n\n"));
+      scs_str newline_str = is_double_newline ? STR("\n\n") : STR("\n");
+
+      /* print the current line and calculate the next line's indentation */
+      if (output_txt_contains_chars) {
+        scs_node *top = node_list_peek(&paren_stack, 0);
+
+        /* Check for Rule 3: are we inside a paren stack that crosses into the
+         * next line, and has a Rule 3 check not been done for it yet? */
+        if (top && !top->rule3_search_complete) {
+          int num_opening_line_nodes = top->opening_line_nodes.size;
+          if (num_opening_line_nodes > 2) {
+            /* start at 1 because the first node is always skipped */
+            int opening_line_node_idx = 1;
+            /* we must be past the first whitespace node to look for alignment nodes */
+            bool past_first_whitespace_node = false;
+            bool search_for_alignment_node = true;
+            while (search_for_alignment_node) {
+              scs_node *opening_line_node = top->opening_line_nodes.items[opening_line_node_idx];
+              if (opening_line_node) {
+                /* is the first node on the new line vertically aligned with a
+                 * node on the line above in the same paren stack? */
+                if (past_first_whitespace_node && is_node_with_non_blank_text(opening_line_node) &&
+                    opening_line_node->orig_col_idx == num_spaces_on_next_line) {
+                  /* Rule 3 is activated */
+                  top->rule3_active = true;
+                  /* the original column decides Rule 3 alignment, but the printed
+                   * column decides the number of leading spaces */
+                  top->rule3_num_spaces = opening_line_node->printed_col_idx;
+                  search_for_alignment_node = false;
+                } else if (!past_first_whitespace_node && is_whitespace_node(opening_line_node)) {
+                  past_first_whitespace_node = true;
+                }
+              }
+
+              opening_line_node_idx++;
+              if (opening_line_node_idx >= num_opening_line_nodes) {
+                search_for_alignment_node = false;
+              }
+            }
+          }
+          /* only check for Rule 3 alignment once per paren stack */
+          top->rule3_search_complete = true;
+        }
+
+        /* Is there a comment line that looks vertically aligned with a node on
+         * the previous line? (Rule 3 for single line comments) */
+        int col_idx_of_single_line_comment_alignment_node = -1;
+        bool comment_looks_aligned_with_previous_form = false;
+        if (next_line_contains_only_one_comment && !is_double_newline) {
+          int num_prev_line_nodes = nodes_we_have_printed_on_this_line.size;
+          for (int idx2 = 0; idx2 < num_prev_line_nodes; idx2++) {
+            scs_node *prev_line_node = nodes_we_have_printed_on_this_line.items[idx2];
+            scs_node *prev_node2 =
+                idx2 > 0 ? nodes_we_have_printed_on_this_line.items[idx2 - 1] : NULL;
+
+            bool is_possible_alignment_node = false;
+            if (is_node_with_non_blank_text(prev_line_node)) {
+              if (!prev_node2 || !is_paren_opener(prev_node2)) {
+                is_possible_alignment_node = true;
+              }
+            }
+
+            if (is_possible_alignment_node &&
+                next_line_comment_col_idx == prev_line_node->orig_col_idx) {
+              col_idx_of_single_line_comment_alignment_node = prev_line_node->printed_col_idx;
+              comment_looks_aligned_with_previous_form = true;
+              break;
+            }
+          }
+        }
+
+        int num_spaces = 0;
+        if (top && top->rule3_active) {
+          /* inside a paren stack with Rule 3 activated: use that first */
+          num_spaces = top->rule3_num_spaces;
+        } else if (next_line_contains_only_one_comment &&
+                   comment_looks_aligned_with_previous_form) {
+          /* a comment line vertically aligned with a node on the line above: align to that node */
+          num_spaces = col_idx_of_single_line_comment_alignment_node;
+        } else if (next_line_contains_only_one_comment && !top) {
+          /* a comment line outside of a paren stack with no obvious relation to
+           * the lines above it: keep its current indentation */
+          num_spaces = num_spaces_on_next_line;
+        } else {
+          /* regular fixed indentation based on the paren stack depth */
+          num_spaces = num_spaces_for_indentation(ctx, top);
+        }
+
+        scs_str indentation_str = repeat_string(ctx, STR(" "), num_spaces);
+
+        /* if everything on this line was slurped up, the line can be removed */
+        if (all_next_line_nodes_were_slurped_up) {
+          newline_str = EMPTY_STR;
+          indentation_str = EMPTY_STR;
+        }
+
+        if (is_comma_node(node)) {
+          scs_str next_line_comma_trail = remove_leading_whitespace(node->text);
+          scs_str trimmed_comma_trail = rtrim(next_line_comma_trail);
+          indentation_str = str_concat(ctx, indentation_str, trimmed_comma_trail);
+        }
+
+        /* add this line to the output and reset the line */
+        if (str_has_non_whitespace_chars(line_str(&line_txt))) {
+          strbuf_append(ctx, &out_txt, line_str(&line_txt));
+        }
+        strbuf_append(ctx, &out_txt, newline_str);
+
+        line_set(ctx, &line_txt, indentation_str);
+        nodes_we_have_printed_on_this_line.size = 0;
+
+        col_idx = str_len(indentation_str);
+
+        line_idx++;
+        if (is_double_newline) {
+          line_idx++;
+        }
+      }
+
+      /* this node has been taken care of: skip the normal printing step */
+      skip_printing_this_node = true;
+    } /* end current_node_is_newline */
+
+    if (node_contains_text(node) && !skip_printing_this_node) {
+      bool is_token_followed_by_opener =
+          is_token_node(node) && next_text_node && is_paren_opener(next_text_node);
+      bool is_paren_closer_followed_by_text =
+          is_paren_closer(node) && next_text_node &&
+          (is_token_node(next_text_node) || is_paren_opener(next_text_node));
+      bool add_space_after_this_node =
+          is_token_followed_by_opener || is_paren_closer_followed_by_text;
+
+      scs_str node_txt = node->text;
+      if (is_comment_node(node)) {
+        if (comment_needs_space_inside(node_txt)) {
+          node_txt = add_space_inside_comment(ctx, node_txt);
+        }
+        if (comment_needs_space_before(line_str(&line_txt), node_txt)) {
+          node_txt = str_concat(ctx, STR(" "), node_txt);
+        }
+      }
+
+      if (current_node_is_whitespace && (is_last_node || !output_txt_contains_chars)) {
+        /* a whitespace node as the first or last node is not printed */
+        skip_printing_this_node = true;
+      } else if (is_comment_node(node) && str_eq(parsed_ns->comment_outside_ns_form, node->text) &&
+                 line_idx == line_idx_of_closing_ns_form) {
+        /* a comment on the last line of the ns form is printed by format_ns */
+        skip_printing_this_node = true;
+      } else if (current_node_is_whitespace && line_idx == line_idx_of_closing_ns_form) {
+        skip_printing_this_node = true;
+      }
+
+      /* add the text of this node to the current line */
+      if (!skip_printing_this_node) {
+        int line_length_before_printing_node = line_txt.num_chars;
+        line_append(ctx, &line_txt, node_txt);
+
+        if (line_txt.buf.len > 0) {
+          output_txt_contains_chars = true;
+        }
+
+        node->printed_col_idx = line_length_before_printing_node;
+        node->printed_line_idx = line_idx;
+        node_list_push(ctx, &nodes_we_have_printed_on_this_line, node);
+      }
+
+      if (add_space_after_this_node) {
+        line_append(ctx, &line_txt, STR(" "));
+      }
+
+      col_idx = col_idx + str_len(node_txt);
+    }
+  } /* end looping through the nodes */
+
+  /* add the last line to the output if necessary */
+  if (line_txt.buf.len > 0) {
+    strbuf_append(ctx, &out_txt, line_str(&line_txt));
+  }
+
+  scs_str result = strbuf_to_str(&out_txt);
+
+  /* replace the ns form with the formatted version */
+  if (ns_start_string_idx > 0) {
+    scs_str head_str = substr(result, 0, ns_start_string_idx - 1);
+    scs_str ns_str = format_ns(ctx, parsed_ns);
+    scs_str tail_str = EMPTY_STR;
+    if (ns_end_string_idx > 0) {
+      tail_str = substr(result, ns_end_string_idx + 1, -1);
+    }
+    result = str_concat3(ctx, head_str, ns_str, tail_str);
+  }
+
+  /* remove any leading or trailing whitespace */
+  return str_trim(result);
+}
+
+/* Parses input_txt (Clojure code) and returns it formatted according to
+ * Standard Clojure Style. Throws (via scs_throw) when the input cannot be
+ * formatted. */
+static scs_format_output format(scs_ctx *ctx, scs_str input_txt) {
+  scs_format_output output;
+  output.file_was_ignored = false;
+
+  /* replace any CRLF with LF before anything else */
+  input_txt = crlf_to_lf(ctx, input_txt);
+
+  scs_node *tree = parse(ctx, input_txt);
+  scs_node_list nodes_arr = flatten_tree(ctx, tree);
+
+  if (look_for_ignore_file(&nodes_arr)) {
+    output.file_was_ignored = true;
+    output.out = input_txt;
+    return output;
+  }
+
+  scs_ns *parsed_ns = parse_ns(ctx, &nodes_arr);
+  output.out = format_nodes(ctx, &nodes_arr, parsed_ns);
+  return output;
+}
+
+/* -----------------------------------------------------------------------------
  * Public API
  */
 
@@ -4228,8 +6122,7 @@ const char *scs_version(void) {
   return SCS_VERSION;
 }
 
-/* Parses input_txt (Clojure code) and returns it formatted according to
- * Standard Clojure Style. See standard-clojure-style.h for details. */
+/* see standard-clojure-style.h */
 scs_format_result scs_format(const char *input, size_t input_len) {
   if (input == NULL) {
     return error_result("input must not be NULL");
@@ -4247,14 +6140,32 @@ scs_format_result scs_format(const char *input, size_t input_len) {
   }
   arena_init(&ctx->arena, SCS_ARENA_DEFAULT_BLOCK_SIZE);
 
+  scs_format_result result;
+  memset(&result, 0, sizeof(result));
+
   if (setjmp(ctx->error_jmp) == 0) {
-    /* TODO: the formatter has not been ported yet. Until it is, every call
-     * reports an error rather than pretending to have formatted anything. */
-    scs_throw(ctx, "scs_format is not implemented yet");
+    scs_str input_str;
+    input_str.data = input;
+    input_str.len = (int)input_len;
+    scs_format_output output = format(ctx, input_str);
+
+    /* copy the output out of the arena so it outlives this call */
+    char *out = malloc((size_t)output.out.len + 1);
+    if (out == NULL) {
+      scs_throw(ctx, "out of memory");
+    }
+    copy_bytes(out, output.out.data, output.out.len);
+    out[output.out.len] = '\0';
+
+    result.status = SCS_STATUS_SUCCESS;
+    result.file_was_ignored = output.file_was_ignored;
+    result.out = out;
+    result.out_len = (size_t)output.out.len;
+  } else {
+    /* we get here via scs_throw() */
+    result = error_result(ctx->error_msg);
   }
 
-  /* we only get here via scs_throw() */
-  scs_format_result result = error_result(ctx->error_msg);
   arena_free_all(&ctx->arena);
   free(ctx);
   return result;

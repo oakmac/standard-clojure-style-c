@@ -848,23 +848,117 @@ TEST(version_is_exposed) {
   ASSERT_TRUE(strlen(scs_version()) > 0);
 }
 
-TEST(format_is_not_implemented_yet) {
-  const char *src = "(def a 1)";
+TEST(format_formats_code) {
+  const char *src = "(def a\n(bbb))";
   scs_format_result result = scs_format(src, strlen(src));
 
-  ASSERT_INT_EQ(result.status, SCS_STATUS_ERROR);
+  ASSERT_INT_EQ(result.status, SCS_STATUS_SUCCESS);
   ASSERT_FALSE(result.file_was_ignored);
-  ASSERT_NULL(result.out);
-  ASSERT_INT_EQ(result.out_len, 0);
-  ASSERT_NOT_NULL(result.reason);
-  ASSERT_TRUE(result.reason && strstr(result.reason, "not implemented") != NULL);
+  ASSERT_NULL(result.reason);
+  ASSERT_NOT_NULL(result.out);
+  ASSERT_STR_EQ(result.out, "(def a\n  (bbb))");
+  ASSERT_INT_EQ(result.out_len, strlen("(def a\n  (bbb))"));
+  /* the output is NUL-terminated */
+  ASSERT_INT_EQ(result.out[result.out_len], 0);
 
   scs_format_result_free(&result);
   ASSERT_NULL(result.out);
-  ASSERT_NULL(result.reason);
+  ASSERT_INT_EQ(result.out_len, 0);
 
   /* freeing twice is allowed */
   scs_format_result_free(&result);
+}
+
+TEST(format_does_not_require_a_nul_terminated_input) {
+  /* only the first 7 bytes are the input */
+  const char *src = "(a b c)garbage";
+  scs_format_result result = scs_format(src, 7);
+  ASSERT_INT_EQ(result.status, SCS_STATUS_SUCCESS);
+  ASSERT_STR_EQ(result.out, "(a b c)");
+  scs_format_result_free(&result);
+
+  result = scs_format("", 0);
+  ASSERT_INT_EQ(result.status, SCS_STATUS_SUCCESS);
+  ASSERT_STR_EQ(result.out, "");
+  ASSERT_INT_EQ(result.out_len, 0);
+  scs_format_result_free(&result);
+}
+
+TEST(format_converts_crlf_to_lf) {
+  const char *src = "(def a\r\n  1)\r\n\r\n(def b\r\n2)\r\n";
+  scs_format_result result = scs_format(src, strlen(src));
+  ASSERT_INT_EQ(result.status, SCS_STATUS_SUCCESS);
+  ASSERT_STR_EQ(result.out, "(def a\n  1)\n\n(def b\n  2)");
+  scs_format_result_free(&result);
+}
+
+TEST(format_reports_an_error_for_use) {
+  const char *src = "(ns foo (:use bar))";
+  scs_format_result result = scs_format(src, strlen(src));
+  ASSERT_INT_EQ(result.status, SCS_STATUS_ERROR);
+  ASSERT_NULL(result.out);
+  ASSERT_NOT_NULL(result.reason);
+  ASSERT_TRUE(result.reason && strstr(result.reason, ":use") != NULL);
+  scs_format_result_free(&result);
+  ASSERT_NULL(result.reason);
+}
+
+TEST(format_reports_an_error_for_too_deep_nesting) {
+  test_buf src = {NULL, 0, 0};
+  for (int i = 0; i < SCS_MAX_NESTING_DEPTH + 1; i++) {
+    buf_append_cstr(&src, "(");
+  }
+  scs_format_result result = scs_format(src.data, src.len);
+  ASSERT_INT_EQ(result.status, SCS_STATUS_ERROR);
+  ASSERT_TRUE(result.reason && strstr(result.reason, "nested too deeply") != NULL);
+  scs_format_result_free(&result);
+  free(src.data);
+}
+
+TEST(format_ignores_a_file_with_the_ignore_file_marker) {
+  const char *src = "#_ :standard-clj/ignore-file\n(def   a\n(b))";
+  scs_format_result result = scs_format(src, strlen(src));
+  ASSERT_INT_EQ(result.status, SCS_STATUS_SUCCESS);
+  ASSERT_TRUE(result.file_was_ignored);
+  /* the output is the input, untouched */
+  ASSERT_STR_EQ(result.out, src);
+  scs_format_result_free(&result);
+
+  /* the map form of the marker */
+  src = "#_{:standard-clj/ignore-file true}\n(def   a\n(b))";
+  result = scs_format(src, strlen(src));
+  ASSERT_INT_EQ(result.status, SCS_STATUS_SUCCESS);
+  ASSERT_TRUE(result.file_was_ignored);
+  ASSERT_STR_EQ(result.out, src);
+  scs_format_result_free(&result);
+
+  /* the marker only counts before the ns form */
+  src = "(ns foo)\n#_ :standard-clj/ignore-file\n(def   a\n(b))";
+  result = scs_format(src, strlen(src));
+  ASSERT_INT_EQ(result.status, SCS_STATUS_SUCCESS);
+  ASSERT_FALSE(result.file_was_ignored);
+  /* (only indentation changes; spacing inside a line is preserved) */
+  ASSERT_STR_EQ(result.out, "(ns foo)\n#_ :standard-clj/ignore-file\n(def   a\n  (b))");
+  scs_format_result_free(&result);
+
+  /* an ignored file with CRLF line endings is returned with LF line endings */
+  src = "#_ :standard-clj/ignore-file\r\n(def   a)";
+  result = scs_format(src, strlen(src));
+  ASSERT_TRUE(result.file_was_ignored);
+  ASSERT_STR_EQ(result.out, "#_ :standard-clj/ignore-file\n(def   a)");
+  scs_format_result_free(&result);
+}
+
+TEST(format_is_idempotent_on_its_own_output) {
+  const char *src =
+      "(ns foo.bar\n  (:require [b.b :as b] [a.a :as a]))\n\n(defn x [y]\n(let [z 1]\nz))";
+  scs_format_result once = scs_format(src, strlen(src));
+  ASSERT_INT_EQ(once.status, SCS_STATUS_SUCCESS);
+  scs_format_result twice = scs_format(once.out, once.out_len);
+  ASSERT_INT_EQ(twice.status, SCS_STATUS_SUCCESS);
+  ASSERT_STR_EQ(twice.out, once.out);
+  scs_format_result_free(&once);
+  scs_format_result_free(&twice);
 }
 
 TEST(format_rejects_null_input) {
@@ -1013,8 +1107,11 @@ TEST(str_basics) {
   ASSERT_FALSE(str_eq(s, STR("hellO")));
   ASSERT_FALSE(str_eq(s, STR("hell")));
   ASSERT_TRUE(str_eq(EMPTY_STR, STR("")));
-  ASSERT_TRUE(str_has_chars(STR(" ")));
-  ASSERT_FALSE(str_has_chars(EMPTY_STR));
+  /* a zero-initialized string is a valid empty string */
+  scs_str zeroed = {NULL, 0};
+  ASSERT_TRUE(str_eq(zeroed, EMPTY_STR));
+  ASSERT_INT_EQ(str_len(zeroed), 0);
+  ASSERT_INT_EQ(str_compare(zeroed, EMPTY_STR), 0);
 }
 
 TEST(char_at) {
@@ -1204,19 +1301,6 @@ TEST(str_ends_with) {
   ASSERT_FALSE(str_ends_with(STR("lo"), STR("hello")));
 }
 
-TEST(str_replace_first) {
-  scs_ctx *ctx = test_ctx_new();
-  ASSERT_SSTR_EQ(str_replace_first(ctx, STR("hello world"), STR("world"), STR("there")),
-                 "hello there");
-  ASSERT_SSTR_EQ(str_replace_first(ctx, STR("hello hello"), STR("hello"), STR("hi")), "hi hello");
-  /* edge cases */
-  ASSERT_SSTR_EQ(str_replace_first(ctx, STR(""), STR("a"), STR("b")), "");
-  ASSERT_SSTR_EQ(str_replace_first(ctx, STR("hello"), STR(""), STR("x")), "hello");
-  ASSERT_SSTR_EQ(str_replace_first(ctx, STR("hello"), STR("x"), STR("y")), "hello");
-  ASSERT_SSTR_EQ(str_replace_first(ctx, STR("abc"), STR("b"), STR("")), "ac");
-  test_ctx_free(ctx);
-}
-
 TEST(str_replace_all) {
   scs_ctx *ctx = test_ctx_new();
   ASSERT_SSTR_EQ(str_replace_all(ctx, STR("aaa"), STR("a"), STR("b")), "bbb");
@@ -1253,10 +1337,9 @@ TEST(str_concat) {
   ASSERT_SSTR_EQ(str_concat(ctx, STR("a"), STR("")), "a");
   ASSERT_SSTR_EQ(str_concat3(ctx, STR("a"), STR("b"), STR("c")), "abc");
   ASSERT_SSTR_EQ(str_concat3(ctx, STR(""), STR("b"), STR("")), "b");
-  /* the result is a copy in the arena, not a view */
-  scs_str copy = str_copy(ctx, STR("xyz"));
-  ASSERT_SSTR_EQ(copy, "xyz");
-  ASSERT_TRUE(copy.data != STR("xyz").data || true); /* literals may be merged; just exercise it */
+  /* the result is a copy in the arena, not a view of either input */
+  scs_str joined = str_concat(ctx, STR("xy"), STR("z"));
+  ASSERT_TRUE(joined.data != STR("xy").data);
   test_ctx_free(ctx);
 }
 
@@ -1550,17 +1633,6 @@ TEST(is_space_or_comma) {
   ASSERT_FALSE(is_space_or_comma(STR("\t")));
   ASSERT_FALSE(is_space_or_comma(STR("")));
   ASSERT_FALSE(is_space_or_comma(STR(", ")));
-}
-
-TEST(remove_chars_up_to_newline) {
-  ASSERT_SSTR_EQ(remove_chars_up_to_newline(STR("abc\nxyz")), "xyz");
-  ASSERT_SSTR_EQ(remove_chars_up_to_newline(STR("abc")), "abc");
-  ASSERT_SSTR_EQ(remove_chars_up_to_newline(STR("abc\ndef\n\nxyz")), "xyz");
-  /* newline at the very end, or the string is only a newline */
-  ASSERT_SSTR_EQ(remove_chars_up_to_newline(STR("abc\n")), "");
-  ASSERT_SSTR_EQ(remove_chars_up_to_newline(STR("\n")), "");
-  ASSERT_SSTR_EQ(remove_chars_up_to_newline(STR("")), "");
-  ASSERT_SSTR_EQ(remove_chars_up_to_newline(STR("\nabc")), "abc");
 }
 
 TEST(txt_has_commas_after_newline) {
@@ -2422,6 +2494,149 @@ static void run_parse_ns_test_cases(void) {
 }
 
 /* -----------------------------------------------------------------------------
+ * Format test cases (test_cases/format_tests.json)
+ */
+
+/* these cases are skipped by the JavaScript test suite as well */
+static const char *const format_cases_to_skip[] = {"Surrounding newlines removed 3",
+                                                   "ambiguous import comment", NULL};
+
+static void run_format_test_cases(void) {
+  test_case_list cases = read_test_cases("test_cases/format_tests.json");
+  for (int i = 0; i < cases.size; i++) {
+    test_case tc = cases.items[i];
+    char name[512];
+    snprintf(name, sizeof(name), "format: %.*s", tc.name.len, tc.name.data);
+    if (!should_run_test(name) || should_skip_case(format_cases_to_skip, tc.name)) {
+      continue;
+    }
+    start_test(name);
+
+    scs_format_result result = scs_format(tc.input.data, (size_t)tc.input.len);
+    assertions_run++;
+    if (result.status != SCS_STATUS_SUCCESS) {
+      char msg[1024];
+      snprintf(msg, sizeof(msg), "scs_format reported an error: %s",
+               result.reason ? result.reason : "(none)");
+      report_failure(__FILE__, __LINE__, msg);
+    } else {
+      scs_str actual;
+      actual.data = result.out;
+      actual.len = (int)result.out_len;
+      if (!str_eq(actual, tc.expected)) {
+        report_failure(__FILE__, __LINE__, "formatted output does not match");
+        report_case_mismatch(tc.expected, actual);
+      }
+    }
+    scs_format_result_free(&result);
+    finish_test();
+  }
+  free_test_cases(&cases);
+}
+
+/* -----------------------------------------------------------------------------
+ * Robustness
+ *
+ * A formatter runs on untrusted files, so it must never crash: every input
+ * produces either formatted output or a clean error. These tests feed random
+ * and mutated inputs through scs_format(). They are most valuable under the
+ * sanitizers (make test-asan).
+ */
+
+/* a small deterministic random number generator (xorshift32) */
+static unsigned int rng_state = 0x9E3779B9u;
+
+static unsigned int rng_next(void) {
+  unsigned int x = rng_state;
+  x ^= x << 13;
+  x ^= x >> 17;
+  x ^= x << 5;
+  rng_state = x;
+  return x;
+}
+
+static int rng_below(int n) {
+  return (int)(rng_next() % (unsigned int)n);
+}
+
+/* checks that formatting an input either succeeds or fails cleanly */
+static void check_format_does_not_crash(const char *input, size_t len) {
+  scs_format_result result = scs_format(input, len);
+  assertions_run++;
+  if (result.status == SCS_STATUS_SUCCESS) {
+    if (result.out == NULL || strlen(result.out) != result.out_len) {
+      report_failure(__FILE__, __LINE__, "success result has a bad output string");
+    }
+  } else if (result.status != SCS_STATUS_ERROR || result.out != NULL) {
+    report_failure(__FILE__, __LINE__, "error result has a bad shape");
+  }
+  scs_format_result_free(&result);
+}
+
+TEST(robustness_random_clojure_like_input) {
+  static const char alphabet[] =
+      "()[]{}#\";:^@'`~,_ \n\t\r#?@abcxyz0129-.+/*!?<>=&%$|\xcf\x83\xe6\x97\xa5\x80\xff";
+  rng_state = 0x12345678u;
+  for (int iteration = 0; iteration < 400; iteration++) {
+    int len = rng_below(120);
+    char *input = malloc((size_t)len + 1);
+    if (!input) {
+      exit(1);
+    }
+    for (int i = 0; i < len; i++) {
+      input[i] = alphabet[rng_below((int)sizeof(alphabet) - 1)];
+    }
+    input[len] = '\0';
+    check_format_does_not_crash(input, (size_t)len);
+    free(input);
+  }
+}
+
+TEST(robustness_mutated_test_case_inputs) {
+  test_case_list cases = read_test_cases("test_cases/format_tests.json");
+  rng_state = 0xC0FFEEu;
+  for (int i = 0; i < cases.size; i++) {
+    scs_str original = cases.items[i].input;
+    for (int mutation = 0; mutation < 3; mutation++) {
+      test_buf buf = {NULL, 0, 0};
+      buf_append(&buf, original.data, (size_t)original.len);
+      /* delete, duplicate, or replace a few bytes */
+      int num_edits = 1 + rng_below(3);
+      for (int edit = 0; edit < num_edits && buf.len > 0; edit++) {
+        size_t pos = (size_t)rng_below((int)buf.len);
+        switch (rng_below(3)) {
+        case 0:
+          memmove(buf.data + pos, buf.data + pos + 1, buf.len - pos - 1);
+          buf.len--;
+          break;
+        case 1:
+          buf.data[pos] = "()[]{}\"#;\\\n ^@"[rng_below(14)];
+          break;
+        default:
+          buf_append(&buf, buf.data + pos, 1);
+          break;
+        }
+      }
+      check_format_does_not_crash(buf.data ? buf.data : "", buf.len);
+      free(buf.data);
+    }
+  }
+  free_test_cases(&cases);
+}
+
+TEST(robustness_truncated_test_case_inputs) {
+  test_case_list cases = read_test_cases("test_cases/parser_tests.json");
+  for (int i = 0; i < cases.size; i++) {
+    scs_str input = cases.items[i].input;
+    /* every prefix of every parser test input */
+    for (int len = 0; len <= input.len; len++) {
+      check_format_does_not_crash(input.data, (size_t)len);
+    }
+  }
+  free_test_cases(&cases);
+}
+
+/* -----------------------------------------------------------------------------
  * Main
  */
 
@@ -2433,7 +2648,13 @@ int main(int argc, char **argv) {
   }
 
   RUN_TEST(version_is_exposed);
-  RUN_TEST(format_is_not_implemented_yet);
+  RUN_TEST(format_formats_code);
+  RUN_TEST(format_does_not_require_a_nul_terminated_input);
+  RUN_TEST(format_converts_crlf_to_lf);
+  RUN_TEST(format_reports_an_error_for_use);
+  RUN_TEST(format_reports_an_error_for_too_deep_nesting);
+  RUN_TEST(format_ignores_a_file_with_the_ignore_file_marker);
+  RUN_TEST(format_is_idempotent_on_its_own_output);
   RUN_TEST(format_rejects_null_input);
   RUN_TEST(format_result_free_accepts_null);
 
@@ -2460,7 +2681,6 @@ int main(int argc, char **argv) {
   RUN_TEST(str_trim);
   RUN_TEST(str_starts_with);
   RUN_TEST(str_ends_with);
-  RUN_TEST(str_replace_first);
   RUN_TEST(str_replace_all);
   RUN_TEST(crlf_to_lf);
   RUN_TEST(str_concat);
@@ -2482,7 +2702,6 @@ int main(int argc, char **argv) {
   RUN_TEST(remove_leading_whitespace);
   RUN_TEST(remove_trailing_whitespace);
   RUN_TEST(is_space_or_comma);
-  RUN_TEST(remove_chars_up_to_newline);
   RUN_TEST(txt_has_commas_after_newline);
   RUN_TEST(num_spaces_after_newline);
   RUN_TEST(is_newline_node_with_comma_on_next_line);
@@ -2527,6 +2746,12 @@ int main(int argc, char **argv) {
   RUN_TEST(parse_ns_without_an_ns_form);
 
   run_parse_ns_test_cases();
+
+  run_format_test_cases();
+
+  RUN_TEST(robustness_random_clojure_like_input);
+  RUN_TEST(robustness_mutated_test_case_inputs);
+  RUN_TEST(robustness_truncated_test_case_inputs);
 
   if (tests_run == 0) {
     printf("no tests matched \"%s\"\n", test_filter ? test_filter : "");
