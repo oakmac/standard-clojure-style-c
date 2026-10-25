@@ -8,3 +8,4 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 - project skeleton: build files, public header, arena allocator, error handling, test runner
+- UTF-8 string helpers, node and string lists, stack operations, whitespace and comment helpers

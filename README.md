@@ -128,7 +128,7 @@ Standard Clojure Style JavaScript they implement.
 ## Roadmap
 
 - [x] project skeleton: build, public header, arena allocator, error handling, test runner
-- [ ] string, stack, and array helpers, tested against the JavaScript internals tests
+- [x] string, stack, and array helpers, tested against the JavaScript internals tests
 - [ ] parser (terminal parsers, sequence parsers, grammar), tested against `test_parser/`
 - [ ] `ns` form parsing, tested against `test_parse_ns/`
 - [ ] formatter, tested against `test_format/`
