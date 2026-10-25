@@ -168,6 +168,8 @@ typedef struct scs_ctx {
   scs_arena arena;
   jmp_buf error_jmp;
   const char *error_msg; /* NULL until an error is thrown; a static or arena string */
+  int id_counter;        /* the last id handed out by create_id() */
+  int nesting_depth;     /* how deeply nested the form being parsed is */
 } scs_ctx;
 
 /* records an error message and jumps back to scs_format() */
@@ -839,6 +841,815 @@ static scs_node *node_list_peek(const scs_node_list *list, int idx_from_back) {
 /* returns the last node, or NULL if the list is empty */
 static scs_node *node_list_last(const scs_node_list *list) {
   return node_list_peek(list, 0);
+}
+
+/* -----------------------------------------------------------------------------
+ * Node Construction
+ */
+
+/* returns a new unique id (unique within one context) */
+static int create_id(scs_ctx *ctx) {
+  ctx->id_counter = ctx->id_counter + 1;
+  return ctx->id_counter;
+}
+
+static scs_node *node_new(scs_ctx *ctx, const char *name, int start_idx, int end_idx,
+                          scs_str text) {
+  scs_node *node = scs_alloc(ctx, sizeof(scs_node));
+  node->id = create_id(ctx);
+  node->name = name;
+  node->text = text;
+  node->start_idx = start_idx;
+  node->end_idx = end_idx;
+  node->orig_col_idx = -1;
+  node->printed_col_idx = -1;
+  node->printed_line_idx = -1;
+  node->was_slurped_up = false;
+  return node;
+}
+
+/* -----------------------------------------------------------------------------
+ * Parsers
+ *
+ * The parser is a small parser-combinator library. A parser is a struct with a
+ * parse function and whatever configuration that function needs. Terminal
+ * parsers match text directly; sequence parsers combine other parsers. Each
+ * parse function is given the full input and a position and returns a node (or
+ * NULL when it does not match). The grammar further below is built from static
+ * const instances of these structs, so it is immutable and shared by all calls.
+ *
+ * While parsing, positions and node indexes are BYTE offsets into the input,
+ * which keeps matching simple and fast. parse() converts every node's indexes
+ * to code points once the whole tree has been built.
+ */
+
+typedef struct scs_parser scs_parser;
+
+typedef scs_node *(*scs_parse_fn)(scs_ctx *ctx, const scs_parser *parser, scs_str txt, int pos);
+
+/* A text matcher: returns the number of bytes matched at pos, or -1 for no
+ * match. Used by pattern parsers in place of regular expressions. */
+typedef int (*scs_match_fn)(scs_str txt, int pos);
+
+struct scs_parser {
+  scs_parse_fn parse;
+  const char *name; /* the name given to matched nodes; NULL for an unnamed node */
+
+  /* terminal parsers */
+  char ch;            /* Char, NotChar */
+  scs_str str;        /* String */
+  scs_match_fn match; /* Pattern */
+
+  /* sequence parsers */
+  const scs_parser *const *parsers; /* Seq, Choice */
+  int num_parsers;
+  const scs_parser *parser; /* Repeat, Optional, Named */
+  int min_matches;          /* Repeat */
+};
+
+#define NUM_PARSERS(arr) ((int)(sizeof(arr) / sizeof((arr)[0])))
+
+/* a view of the input from byte offset start (inclusive) to end (exclusive) */
+static scs_str str_slice(scs_str s, int start, int end) {
+  scs_str result;
+  result.data = s.data + start;
+  result.len = end - start;
+  return result;
+}
+
+/* -----------------------------------------------------------------------------
+ * Terminal Parsers
+ */
+
+/* matches any single character */
+static scs_node *parse_any_char(scs_ctx *ctx, const scs_parser *p, scs_str txt, int pos) {
+  if (pos < 0 || pos >= txt.len) {
+    return NULL;
+  }
+  int end = pos + utf8_char_bytes(txt, pos);
+  return node_new(ctx, p->name, pos, end, str_slice(txt, pos, end));
+}
+
+/* matches one specific character */
+static scs_node *parse_char(scs_ctx *ctx, const scs_parser *p, scs_str txt, int pos) {
+  if (pos < 0 || pos >= txt.len || txt.data[pos] != p->ch) {
+    return NULL;
+  }
+  return node_new(ctx, p->name, pos, pos + 1, str_slice(txt, pos, pos + 1));
+}
+
+/* matches any single character except one */
+static scs_node *parse_not_char(scs_ctx *ctx, const scs_parser *p, scs_str txt, int pos) {
+  if (pos < 0 || pos >= txt.len || txt.data[pos] == p->ch) {
+    return NULL;
+  }
+  int end = pos + utf8_char_bytes(txt, pos);
+  return node_new(ctx, p->name, pos, end, str_slice(txt, pos, end));
+}
+
+/* matches a specific string */
+static scs_node *parse_string(scs_ctx *ctx, const scs_parser *p, scs_str txt, int pos) {
+  if (pos < 0 || pos + p->str.len > txt.len ||
+      memcmp(txt.data + pos, p->str.data, (size_t)p->str.len) != 0) {
+    return NULL;
+  }
+  int end = pos + p->str.len;
+  return node_new(ctx, p->name, pos, end, str_slice(txt, pos, end));
+}
+
+/* matches whatever the parser's match function matches */
+static scs_node *parse_pattern(scs_ctx *ctx, const scs_parser *p, scs_str txt, int pos) {
+  if (pos < 0 || pos > txt.len) {
+    return NULL;
+  }
+  int num_bytes = p->match(txt, pos);
+  if (num_bytes < 0) {
+    return NULL;
+  }
+  int end = pos + num_bytes;
+  return node_new(ctx, p->name, pos, end, str_slice(txt, pos, end));
+}
+
+/* -----------------------------------------------------------------------------
+ * Sequence Parsers
+ */
+
+/* Adds node to the list of children. A named node is added as-is; an unnamed
+ * node is flattened, so its children are added instead. */
+static void append_children(scs_ctx *ctx, scs_node_list *children, scs_node *node) {
+  if (node->name != NULL) {
+    node_list_push(ctx, children, node);
+  } else {
+    for (int i = 0; i < node->children.size; i++) {
+      append_children(ctx, children, node->children.items[i]);
+    }
+  }
+}
+
+/* matches a linear sequence of parsers */
+static scs_node *parse_seq(scs_ctx *ctx, const scs_parser *p, scs_str txt, int pos) {
+  scs_node_list children = {NULL, 0, 0};
+  int end_idx = pos;
+
+  for (int j = 0; j < p->num_parsers; j++) {
+    const scs_parser *parser = p->parsers[j];
+    scs_node *possible_node = parser->parse(ctx, parser, txt, end_idx);
+    if (!possible_node) {
+      return NULL;
+    }
+    append_children(ctx, &children, possible_node);
+    end_idx = possible_node->end_idx;
+  }
+
+  scs_node *node = node_new(ctx, p->name, pos, end_idx, EMPTY_STR);
+  node->children = children;
+  return node;
+}
+
+/* matches the first of several parsers that matches */
+static scs_node *parse_choice(scs_ctx *ctx, const scs_parser *p, scs_str txt, int pos) {
+  for (int i = 0; i < p->num_parsers; i++) {
+    const scs_parser *parser = p->parsers[i];
+    scs_node *possible_node = parser->parse(ctx, parser, txt, pos);
+    if (possible_node) {
+      return possible_node;
+    }
+  }
+  return NULL;
+}
+
+/* Matches the child parser zero or more times (at least min_matches times).
+ * The node is named only when something was matched. */
+static scs_node *parse_repeat(scs_ctx *ctx, const scs_parser *p, scs_str txt, int pos) {
+  scs_node_list children = {NULL, 0, 0};
+  int end_idx = pos;
+
+  while (true) {
+    scs_node *node = p->parser->parse(ctx, p->parser, txt, end_idx);
+    if (!node) {
+      break;
+    }
+    append_children(ctx, &children, node);
+    end_idx = node->end_idx;
+  }
+
+  if (children.size < p->min_matches) {
+    return NULL;
+  }
+
+  const char *name = end_idx > pos ? p->name : NULL;
+  scs_node *node = node_new(ctx, name, pos, end_idx, EMPTY_STR);
+  node->children = children;
+  return node;
+}
+
+/* matches the child parser, or matches nothing (an empty unnamed node) */
+static scs_node *parse_optional(scs_ctx *ctx, const scs_parser *p, scs_str txt, int pos) {
+  scs_node *node = p->parser->parse(ctx, p->parser, txt, pos);
+  if (node && node->text.len > 0) {
+    return node;
+  }
+  return node_new(ctx, NULL, pos, pos, EMPTY_STR);
+}
+
+/* Gives a name to whatever the child parser matches. An unnamed node is
+ * renamed in place; a named node is wrapped in a new node. */
+static scs_node *parse_named(scs_ctx *ctx, const scs_parser *p, scs_str txt, int pos) {
+  scs_node *node = p->parser->parse(ctx, p->parser, txt, pos);
+  if (!node) {
+    return NULL;
+  }
+  if (node->name == NULL) {
+    node->name = p->name;
+    return node;
+  }
+  scs_node *wrapper = node_new(ctx, p->name, node->start_idx, node->end_idx, EMPTY_STR);
+  node_list_push(ctx, &wrapper->children, node);
+  return wrapper;
+}
+
+/* -----------------------------------------------------------------------------
+ * Text Matchers
+ *
+ * The small patterns the grammar needs, written by hand. Each returns the
+ * number of bytes matched at pos, or -1 for no match.
+ */
+
+/* the characters that separate tokens: space, comma, the ASCII control
+ * characters used as whitespace, and the Unicode space separators */
+static bool is_token_whitespace(int code_point) {
+  switch (code_point) {
+  case ' ':
+  case ',':
+  case '\n':
+  case '\r':
+  case '\t':
+  case '\f':
+  case 0x000B: /* vertical tab */
+  case 0x001C: /* file separator */
+  case 0x001D: /* group separator */
+  case 0x001E: /* record separator */
+  case 0x001F: /* unit separator */
+  case 0x2028: /* line separator */
+  case 0x2029: /* paragraph separator */
+  case 0x1680: /* ogham space mark */
+  case 0x2008: /* punctuation space */
+  case 0x2009: /* thin space */
+  case 0x200A: /* hair space */
+  case 0x205F: /* medium mathematical space */
+  case 0x3000: /* ideographic space */
+    return true;
+  default:
+    return (code_point >= 0x2000 && code_point <= 0x2006); /* en quad ... six-per-em space */
+  }
+}
+
+/* characters that cannot start a token */
+static bool is_token_head_char(int code_point) {
+  switch (code_point) {
+  case '(':
+  case ')':
+  case '[':
+  case ']':
+  case '{':
+  case '}':
+  case '"':
+  case '@':
+  case '~':
+  case '^':
+  case ';':
+  case '`':
+  case '#':
+  case '\'':
+    return true;
+  default:
+    return false;
+  }
+}
+
+/* characters that end a token */
+static bool is_token_tail_char(int code_point) {
+  switch (code_point) {
+  case '(':
+  case ')':
+  case '[':
+  case ']':
+  case '{':
+  case '}':
+  case '"':
+  case '@':
+  case '^':
+  case ';':
+  case '`':
+    return true;
+  default:
+    return false;
+  }
+}
+
+/* a backslash followed by one of these is a character literal like \( or \space's first char */
+static bool is_char_literal_char(char c) {
+  switch (c) {
+  case '(':
+  case ')':
+  case '[':
+  case ']':
+  case '{':
+  case '}':
+  case '"':
+  case '@':
+  case '^':
+  case ';':
+  case '`':
+  case ',':
+  case ' ':
+    return true;
+  default:
+    return false;
+  }
+}
+
+/* a line terminator for the purposes of a string body escape */
+static bool is_line_terminator(int code_point) {
+  return code_point == '\n' || code_point == '\r' || code_point == 0x2028 || code_point == 0x2029;
+}
+
+static bool is_ascii_letter(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+/* a token: either a character literal (a backslash followed by a delimiter), or
+ * a run of characters that does not start with a head character and stops at a
+ * tail character or whitespace; either may be prefixed with ## (as in ##Inf) */
+static int match_token_body(scs_str txt, int pos) {
+  if (pos >= txt.len) {
+    return -1;
+  }
+  if (txt.data[pos] == '\\' && pos + 1 < txt.len && is_char_literal_char(txt.data[pos + 1])) {
+    return 2;
+  }
+
+  int num_bytes = 0;
+  int code_point = utf8_decode(txt, pos, &num_bytes);
+  if (is_token_head_char(code_point) || is_token_whitespace(code_point)) {
+    return -1;
+  }
+  int idx = pos + num_bytes;
+  while (idx < txt.len) {
+    code_point = utf8_decode(txt, idx, &num_bytes);
+    if (is_token_tail_char(code_point) || is_token_whitespace(code_point)) {
+      break;
+    }
+    idx += num_bytes;
+  }
+  return idx - pos;
+}
+
+static int match_token(scs_str txt, int pos) {
+  if (pos + 2 <= txt.len && txt.data[pos] == '#' && txt.data[pos + 1] == '#') {
+    int body = match_token_body(txt, pos + 2);
+    if (body > 0) {
+      return 2 + body;
+    }
+  }
+  return match_token_body(txt, pos);
+}
+
+/* one or more whitespace characters */
+static int match_whitespace(scs_str txt, int pos) {
+  int idx = pos;
+  while (idx < txt.len) {
+    int num_bytes = 0;
+    int code_point = utf8_decode(txt, idx, &num_bytes);
+    if (!is_token_whitespace(code_point)) {
+      break;
+    }
+    idx += num_bytes;
+  }
+  return idx > pos ? idx - pos : -1;
+}
+
+/* a semicolon and everything up to (not including) the end of the line */
+static int match_comment(scs_str txt, int pos) {
+  if (pos >= txt.len || txt.data[pos] != ';') {
+    return -1;
+  }
+  int idx = pos + 1;
+  while (idx < txt.len && txt.data[idx] != '\n') {
+    idx++;
+  }
+  return idx - pos;
+}
+
+/* the opening of a string: a double quote, optionally preceded by # (a regex) */
+static int match_string_open(scs_str txt, int pos) {
+  if (pos < txt.len && txt.data[pos] == '"') {
+    return 1;
+  }
+  if (pos + 1 < txt.len && txt.data[pos] == '#' && txt.data[pos + 1] == '"') {
+    return 2;
+  }
+  return -1;
+}
+
+/* the body of a string: runs of ordinary characters and backslash escapes
+ * (a backslash may escape any character except a line terminator) */
+static int match_string_body(scs_str txt, int pos) {
+  int idx = pos;
+  while (idx < txt.len) {
+    char c = txt.data[idx];
+    if (c == '"') {
+      break;
+    }
+    if (c == '\\') {
+      if (idx + 1 >= txt.len) {
+        break;
+      }
+      int num_bytes = 0;
+      int escaped = utf8_decode(txt, idx + 1, &num_bytes);
+      if (is_line_terminator(escaped)) {
+        break;
+      }
+      idx += 1 + num_bytes;
+    } else {
+      idx++;
+    }
+  }
+  return idx > pos ? idx - pos : -1;
+}
+
+/* The opening of a namespaced map with an alias, such as #:alias{ or #::alias{.
+ * The alias must start with a letter and may continue with lower case letters,
+ * or any ASCII character from '.' through '_' (digits, upper case letters, and
+ * punctuation such as ':' and '/'). Note that '-' is not in that range. */
+static int match_namespaced_map_open(scs_str txt, int pos) {
+  int idx = pos;
+  if (idx + 1 >= txt.len || txt.data[idx] != '#' || txt.data[idx + 1] != ':') {
+    return -1;
+  }
+  idx += 2;
+  if (idx < txt.len && txt.data[idx] == ':') {
+    idx++;
+  }
+  if (idx >= txt.len || !is_ascii_letter(txt.data[idx])) {
+    return -1;
+  }
+  idx++;
+  while (idx < txt.len) {
+    char c = txt.data[idx];
+    bool is_alias_char = (c >= 'a' && c <= 'z') || (c >= '.' && c <= '_');
+    if (!is_alias_char) {
+      break;
+    }
+    idx++;
+  }
+  if (idx >= txt.len || txt.data[idx] != '{') {
+    return -1;
+  }
+  return idx + 1 - pos;
+}
+
+/* returns the length of prefix if txt has it at pos, otherwise -1 */
+static int match_prefix(scs_str txt, int pos, const char *prefix) {
+  int len = (int)strlen(prefix);
+  if (pos + len <= txt.len && memcmp(txt.data + pos, prefix, (size_t)len) == 0) {
+    return len;
+  }
+  return -1;
+}
+
+/* the opening of a list, anonymous function, reader conditional, or eval form:
+ * ( #( #?( #?@( #=( */
+static int match_parens_open(scs_str txt, int pos) {
+  static const char *const openers[] = {"#?@(", "#?(", "#=(", "#(", "("};
+  for (size_t i = 0; i < sizeof(openers) / sizeof(openers[0]); i++) {
+    int len = match_prefix(txt, pos, openers[i]);
+    if (len > 0) {
+      return len;
+    }
+  }
+  return -1;
+}
+
+/* a metadata marker: ^ or #^ */
+static int match_meta_marker(scs_str txt, int pos) {
+  int len = match_prefix(txt, pos, "#^");
+  if (len > 0) {
+    return len;
+  }
+  return match_prefix(txt, pos, "^");
+}
+
+/* a reader macro marker that wraps the following form: @ ' ` ~@ ~ #' */
+static int match_wrap_marker(scs_str txt, int pos) {
+  static const char *const markers[] = {"@", "'", "`", "~@", "~", "#'"};
+  for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); i++) {
+    int len = match_prefix(txt, pos, markers[i]);
+    if (len > 0) {
+      return len;
+    }
+  }
+  return -1;
+}
+
+/* -----------------------------------------------------------------------------
+ * Grammar
+ *
+ * The grammar is recursive (a list contains forms, and a form may be a list),
+ * so a few parsers are declared before they are defined. Every parser is a
+ * static const struct built with designated initializers: the fields that are
+ * not mentioned are zero / NULL.
+ */
+
+/* Collections and reader macros may nest this many levels deep before parsing
+ * stops with an error. This guards against a stack overflow on pathological
+ * input: each level of nesting uses roughly 1 KB of C stack, and the default
+ * thread stack is 1 MB on Windows and 512 KB for secondary threads on macOS.
+ * Real code nests a few dozen levels at most. Override with
+ * -DSCS_MAX_NESTING_DEPTH=N when building if your environment needs a
+ * different limit. */
+#ifndef SCS_MAX_NESTING_DEPTH
+#define SCS_MAX_NESTING_DEPTH 500
+#endif
+
+static const scs_parser p_gap;
+static const scs_parser p_form;
+
+/* string */
+static const scs_parser p_string_open = {
+    .parse = parse_pattern, .name = ".open", .match = match_string_open};
+static const scs_parser p_string_body_text = {
+    .parse = parse_pattern, .name = ".body", .match = match_string_body};
+static const scs_parser p_string_body = {
+    .parse = parse_optional, .name = NULL, .parser = &p_string_body_text};
+static const scs_parser p_string_close_quote = {.parse = parse_char, .name = ".close", .ch = '"'};
+static const scs_parser p_string_close = {
+    .parse = parse_optional, .name = NULL, .parser = &p_string_close_quote};
+static const scs_parser *const string_parsers[] = {&p_string_open, &p_string_body, &p_string_close};
+static const scs_parser p_string = {.parse = parse_seq,
+                                    .name = "string",
+                                    .parsers = string_parsers,
+                                    .num_parsers = NUM_PARSERS(string_parsers)};
+
+/* token, whitespace, comment */
+static const scs_parser p_token = {.parse = parse_pattern, .name = "token", .match = match_token};
+static const scs_parser p_whitespace = {
+    .parse = parse_pattern, .name = "whitespace", .match = match_whitespace};
+static const scs_parser p_comment = {
+    .parse = parse_pattern, .name = "comment", .match = match_comment};
+
+/* zero or more gaps (whitespace, comments, discarded forms) */
+static const scs_parser p_gaps = {.parse = parse_repeat, .name = NULL, .parser = &p_gap};
+
+/* discard: #_ form */
+static const scs_parser p_discard_marker = {
+    .parse = parse_string, .name = "marker", .str = {"#_", 2}};
+static const scs_parser p_discard_body = {.parse = parse_named, .name = ".body", .parser = &p_form};
+static const scs_parser *const discard_parsers[] = {&p_discard_marker, &p_gaps, &p_discard_body};
+static const scs_parser p_discard = {.parse = parse_seq,
+                                     .name = "discard",
+                                     .parsers = discard_parsers,
+                                     .num_parsers = NUM_PARSERS(discard_parsers)};
+
+/* braces: maps, sets, and namespaced maps */
+static const scs_parser p_braces_open_map = {.parse = parse_char, .name = ".open", .ch = '{'};
+static const scs_parser p_braces_open_set = {
+    .parse = parse_string, .name = ".open", .str = {"#{", 2}};
+static const scs_parser p_braces_open_auto_ns = {
+    .parse = parse_string, .name = ".open", .str = {"#::{", 4}};
+static const scs_parser p_braces_open_ns = {
+    .parse = parse_pattern, .name = ".open", .match = match_namespaced_map_open};
+static const scs_parser *const braces_open_parsers[] = {&p_braces_open_map, &p_braces_open_set,
+                                                        &p_braces_open_auto_ns, &p_braces_open_ns};
+static const scs_parser p_braces_open = {.parse = parse_choice,
+                                         .name = NULL,
+                                         .parsers = braces_open_parsers,
+                                         .num_parsers = NUM_PARSERS(braces_open_parsers)};
+static const scs_parser p_braces_error = {.parse = parse_not_char, .name = "error", .ch = '}'};
+static const scs_parser *const braces_body_parsers[] = {&p_gap, &p_form, &p_braces_error};
+static const scs_parser p_braces_body_item = {.parse = parse_choice,
+                                              .name = NULL,
+                                              .parsers = braces_body_parsers,
+                                              .num_parsers = NUM_PARSERS(braces_body_parsers)};
+static const scs_parser p_braces_body = {
+    .parse = parse_repeat, .name = ".body", .parser = &p_braces_body_item};
+static const scs_parser p_braces_close_brace = {.parse = parse_char, .name = ".close", .ch = '}'};
+static const scs_parser p_braces_close = {
+    .parse = parse_optional, .name = NULL, .parser = &p_braces_close_brace};
+static const scs_parser *const braces_parsers[] = {&p_braces_open, &p_braces_body, &p_braces_close};
+static const scs_parser p_braces = {.parse = parse_seq,
+                                    .name = "braces",
+                                    .parsers = braces_parsers,
+                                    .num_parsers = NUM_PARSERS(braces_parsers)};
+
+/* brackets: vectors */
+static const scs_parser p_brackets_open = {.parse = parse_char, .name = ".open", .ch = '['};
+static const scs_parser p_brackets_error = {.parse = parse_not_char, .name = "error", .ch = ']'};
+static const scs_parser *const brackets_body_parsers[] = {&p_gap, &p_form, &p_brackets_error};
+static const scs_parser p_brackets_body_item = {.parse = parse_choice,
+                                                .name = NULL,
+                                                .parsers = brackets_body_parsers,
+                                                .num_parsers = NUM_PARSERS(brackets_body_parsers)};
+static const scs_parser p_brackets_body = {
+    .parse = parse_repeat, .name = ".body", .parser = &p_brackets_body_item};
+static const scs_parser p_brackets_close_bracket = {
+    .parse = parse_char, .name = ".close", .ch = ']'};
+static const scs_parser p_brackets_close = {
+    .parse = parse_optional, .name = NULL, .parser = &p_brackets_close_bracket};
+static const scs_parser *const brackets_parsers[] = {&p_brackets_open, &p_brackets_body,
+                                                     &p_brackets_close};
+static const scs_parser p_brackets = {.parse = parse_seq,
+                                      .name = "brackets",
+                                      .parsers = brackets_parsers,
+                                      .num_parsers = NUM_PARSERS(brackets_parsers)};
+
+/* parens: lists, anonymous functions, reader conditionals */
+static const scs_parser p_parens_open = {
+    .parse = parse_pattern, .name = ".open", .match = match_parens_open};
+static const scs_parser p_parens_error = {.parse = parse_not_char, .name = "error", .ch = ')'};
+static const scs_parser *const parens_body_parsers[] = {&p_gap, &p_form, &p_parens_error};
+static const scs_parser p_parens_body_item = {.parse = parse_choice,
+                                              .name = NULL,
+                                              .parsers = parens_body_parsers,
+                                              .num_parsers = NUM_PARSERS(parens_body_parsers)};
+static const scs_parser p_parens_body = {
+    .parse = parse_repeat, .name = ".body", .parser = &p_parens_body_item};
+static const scs_parser p_parens_close_paren = {.parse = parse_char, .name = ".close", .ch = ')'};
+static const scs_parser p_parens_close = {
+    .parse = parse_optional, .name = NULL, .parser = &p_parens_close_paren};
+static const scs_parser *const parens_parsers[] = {&p_parens_open, &p_parens_body, &p_parens_close};
+static const scs_parser p_parens = {.parse = parse_seq,
+                                    .name = "parens",
+                                    .parsers = parens_parsers,
+                                    .num_parsers = NUM_PARSERS(parens_parsers)};
+
+/* meta: one or more ^metadata markers followed by the form they annotate */
+static const scs_parser p_meta_marker = {
+    .parse = parse_pattern, .name = ".marker", .match = match_meta_marker};
+static const scs_parser p_meta_data = {.parse = parse_named, .name = ".meta", .parser = &p_form};
+static const scs_parser *const meta_item_parsers[] = {&p_meta_marker, &p_gaps, &p_meta_data,
+                                                      &p_gaps};
+static const scs_parser p_meta_item = {.parse = parse_seq,
+                                       .name = NULL,
+                                       .parsers = meta_item_parsers,
+                                       .num_parsers = NUM_PARSERS(meta_item_parsers)};
+static const scs_parser p_meta_items = {
+    .parse = parse_repeat, .name = NULL, .parser = &p_meta_item, .min_matches = 1};
+static const scs_parser p_meta_body = {.parse = parse_named, .name = ".body", .parser = &p_form};
+static const scs_parser *const meta_parsers[] = {&p_meta_items, &p_meta_body};
+static const scs_parser p_meta = {.parse = parse_seq,
+                                  .name = "meta",
+                                  .parsers = meta_parsers,
+                                  .num_parsers = NUM_PARSERS(meta_parsers)};
+
+/* wrap: a reader macro marker followed by the form it applies to */
+static const scs_parser p_wrap_marker = {
+    .parse = parse_pattern, .name = ".marker", .match = match_wrap_marker};
+static const scs_parser p_wrap_body = {.parse = parse_named, .name = ".body", .parser = &p_form};
+static const scs_parser *const wrap_parsers[] = {&p_wrap_marker, &p_gaps, &p_wrap_body};
+static const scs_parser p_wrap = {.parse = parse_seq,
+                                  .name = "wrap",
+                                  .parsers = wrap_parsers,
+                                  .num_parsers = NUM_PARSERS(wrap_parsers)};
+
+/* tagged: #tag form */
+static const scs_parser p_tagged_hash = {.parse = parse_char, .name = NULL, .ch = '#'};
+static const scs_parser p_tagged_tag = {.parse = parse_named, .name = ".tag", .parser = &p_token};
+static const scs_parser p_tagged_body = {.parse = parse_named, .name = ".body", .parser = &p_form};
+static const scs_parser *const tagged_parsers[] = {&p_tagged_hash, &p_gaps, &p_tagged_tag, &p_gaps,
+                                                   &p_tagged_body};
+static const scs_parser p_tagged = {.parse = parse_seq,
+                                    .name = "tagged",
+                                    .parsers = tagged_parsers,
+                                    .num_parsers = NUM_PARSERS(tagged_parsers)};
+
+/* A gap is whitespace, a comment, or a discarded form. The three cannot start
+ * with the same character, so we dispatch on the first character. */
+static scs_node *parse_gap(scs_ctx *ctx, const scs_parser *p, scs_str txt, int pos) {
+  (void)p;
+  if (pos < 0 || pos >= txt.len) {
+    return NULL;
+  }
+  int num_bytes = 0;
+  int code_point = utf8_decode(txt, pos, &num_bytes);
+  if (is_token_whitespace(code_point)) {
+    return p_whitespace.parse(ctx, &p_whitespace, txt, pos);
+  }
+  if (code_point == ';') {
+    return p_comment.parse(ctx, &p_comment, txt, pos);
+  }
+  if (code_point == '#') {
+    return p_discard.parse(ctx, &p_discard, txt, pos);
+  }
+  return NULL;
+}
+
+static const scs_parser p_gap = {.parse = parse_gap, .name = NULL};
+
+/* the forms that can start with # (regex string, set, namespaced map, anonymous
+ * function, reader conditional, var quote, metadata, ##Inf, tagged literal) */
+static const scs_parser *const hash_form_parsers[] = {&p_token, &p_string, &p_parens, &p_braces,
+                                                      &p_wrap,  &p_meta,   &p_tagged};
+static const scs_parser p_hash_form = {.parse = parse_choice,
+                                       .name = NULL,
+                                       .parsers = hash_form_parsers,
+                                       .num_parsers = NUM_PARSERS(hash_form_parsers)};
+
+/* parses a form that may contain other forms, enforcing the nesting limit */
+static scs_node *parse_nested_form(scs_ctx *ctx, const scs_parser *p, scs_str txt, int pos) {
+  ctx->nesting_depth++;
+  if (ctx->nesting_depth > SCS_MAX_NESTING_DEPTH) {
+    scs_throw(ctx, "forms are nested too deeply");
+  }
+  scs_node *node = p->parse(ctx, p, txt, pos);
+  ctx->nesting_depth--;
+  return node;
+}
+
+/* A form is a token, string, collection, or a reader macro applied to a form.
+ * The first character decides which, except for #, which is ambiguous and is
+ * resolved by trying the # forms in order. */
+static scs_node *parse_form(scs_ctx *ctx, const scs_parser *p, scs_str txt, int pos) {
+  (void)p;
+  if (pos < 0 || pos >= txt.len) {
+    return NULL;
+  }
+  char ch = txt.data[pos];
+  if (ch == '(') {
+    return parse_nested_form(ctx, &p_parens, txt, pos);
+  } else if (ch == '[') {
+    return parse_nested_form(ctx, &p_brackets, txt, pos);
+  } else if (ch == '{') {
+    return parse_nested_form(ctx, &p_braces, txt, pos);
+  } else if (ch == '"') {
+    return p_string.parse(ctx, &p_string, txt, pos);
+  } else if (ch == '@' || ch == '\'' || ch == '`' || ch == '~') {
+    return parse_nested_form(ctx, &p_wrap, txt, pos);
+  } else if (ch == '^') {
+    return parse_nested_form(ctx, &p_meta, txt, pos);
+  } else if (ch == '#') {
+    return parse_nested_form(ctx, &p_hash_form, txt, pos);
+  } else {
+    return p_token.parse(ctx, &p_token, txt, pos);
+  }
+}
+
+static const scs_parser p_form = {.parse = parse_form, .name = NULL};
+
+/* source: gaps and forms until the end of the input; anything else is an error node */
+static const scs_parser p_source_error = {.parse = parse_any_char, .name = "error"};
+static const scs_parser *const source_item_parsers[] = {&p_gap, &p_form, &p_source_error};
+static const scs_parser p_source_item = {.parse = parse_choice,
+                                         .name = NULL,
+                                         .parsers = source_item_parsers,
+                                         .num_parsers = NUM_PARSERS(source_item_parsers)};
+static const scs_parser p_source = {
+    .parse = parse_repeat, .name = "source", .parser = &p_source_item};
+
+/* -----------------------------------------------------------------------------
+ * Parse
+ */
+
+/* converts the byte offsets in a tree to code point indexes using a lookup table */
+static void convert_node_indexes(scs_node *node, const int *cp_at_byte) {
+  node->start_idx = cp_at_byte[node->start_idx];
+  node->end_idx = cp_at_byte[node->end_idx];
+  for (int i = 0; i < node->children.size; i++) {
+    convert_node_indexes(node->children.items[i], cp_at_byte);
+  }
+}
+
+/* parses input text (Clojure code) into a tree of nodes */
+static scs_node *parse(scs_ctx *ctx, scs_str txt) {
+  ctx->nesting_depth = 0;
+  scs_node *tree = p_source.parse(ctx, &p_source, txt, 0);
+
+  /* node indexes are byte offsets at this point; they only differ from code
+   * point indexes when the input contains multi-byte characters */
+  bool is_ascii = true;
+  for (int i = 0; i < txt.len; i++) {
+    if ((unsigned char)txt.data[i] >= 0x80) {
+      is_ascii = false;
+      break;
+    }
+  }
+  if (!is_ascii) {
+    int *cp_at_byte = scs_alloc(ctx, ((size_t)txt.len + 1) * sizeof(int));
+    int cp = 0;
+    int byte_idx = 0;
+    while (byte_idx < txt.len) {
+      int num_bytes = utf8_char_bytes(txt, byte_idx);
+      for (int i = 0; i < num_bytes; i++) {
+        cp_at_byte[byte_idx + i] = cp;
+      }
+      byte_idx += num_bytes;
+      cp++;
+    }
+    cp_at_byte[txt.len] = cp;
+    convert_node_indexes(tree, cp_at_byte);
+  }
+
+  return tree;
 }
 
 /* -----------------------------------------------------------------------------

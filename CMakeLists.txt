@@ -42,5 +42,6 @@ if(SCS_BUILD_TESTS)
   add_executable(scs_test test/test_main.c)
   target_include_directories(scs_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_compile_options(scs_test PRIVATE ${SCS_WARNINGS})
-  add_test(NAME scs_test COMMAND scs_test)
+  # the tests read test_cases/*.json relative to the repository root
+  add_test(NAME scs_test COMMAND scs_test WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
