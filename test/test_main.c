@@ -13,6 +13,8 @@
 
 #include "../standard-clojure-style.c"
 
+#include "cjson/cJSON.h"
+
 #include <stdarg.h>
 #include <stdio.h>
 
@@ -564,6 +566,277 @@ static bool parse_throws(scs_ctx *ctx, scs_str txt) {
     return false;
   }
   return true;
+}
+
+/* -----------------------------------------------------------------------------
+ * Test utilities: the parsed ns form as JSON
+ *
+ * The ns test cases describe the expected result as JSON. parse_ns() produces
+ * C structs, so the structs are converted to a cJSON tree with the same keys
+ * the JavaScript implementation uses, and the two trees are compared.
+ */
+
+static cJSON *json_str(scs_str s) {
+  char *tmp = malloc((size_t)s.len + 1);
+  if (!tmp) {
+    fprintf(stderr, "out of memory\n");
+    exit(1);
+  }
+  memcpy(tmp, s.data, (size_t)s.len);
+  tmp[s.len] = '\0';
+  cJSON *item = cJSON_CreateString(tmp);
+  free(tmp);
+  return item;
+}
+
+/* adds a string field, but only when the string is not empty */
+static void json_add_str(cJSON *obj, const char *key, scs_str s) {
+  if (s.len > 0) {
+    cJSON_AddItemToObject(obj, key, json_str(s));
+  }
+}
+
+static cJSON *json_str_list(const scs_str_list *list) {
+  cJSON *arr = cJSON_CreateArray();
+  for (int i = 0; i < list->size; i++) {
+    cJSON_AddItemToArray(arr, json_str(list->items[i]));
+  }
+  return arr;
+}
+
+/* adds a string list field, but only when the list exists */
+static void json_add_str_list(cJSON *obj, const char *key, const scs_str_list *list) {
+  if (list != NULL) {
+    cJSON_AddItemToObject(obj, key, json_str_list(list));
+  }
+}
+
+static void json_add_comments(cJSON *obj, const scs_str_list *comments_above,
+                              scs_str comment_after) {
+  json_add_str_list(obj, "commentsAbove", comments_above);
+  json_add_str(obj, "commentAfter", comment_after);
+}
+
+static cJSON *json_symbols(const scs_ns_symbol_list *list) {
+  cJSON *arr = cJSON_CreateArray();
+  for (int i = 0; i < list->size; i++) {
+    cJSON *itm = cJSON_CreateObject();
+    json_add_str(itm, "symbol", list->items[i].symbol);
+    json_add_str(itm, "platform", list->items[i].platform);
+    cJSON_AddItemToArray(arr, itm);
+  }
+  return arr;
+}
+
+static cJSON *json_renames(const scs_ns_rename_list *list) {
+  cJSON *arr = cJSON_CreateArray();
+  for (int i = 0; i < list->size; i++) {
+    cJSON *itm = cJSON_CreateObject();
+    json_add_str(itm, "fromSymbol", list->items[i].from_symbol);
+    json_add_str(itm, "toSymbol", list->items[i].to_symbol);
+    json_add_str(itm, "platform", list->items[i].platform);
+    cJSON_AddItemToArray(arr, itm);
+  }
+  return arr;
+}
+
+static cJSON *json_require(const scs_ns_require *req) {
+  cJSON *obj = cJSON_CreateObject();
+  json_add_str(obj, "symbol", req->symbol);
+  if (req->symbol_is_string) {
+    cJSON_AddBoolToObject(obj, "symbolIsString", true);
+  }
+  json_add_str(obj, "as", req->as);
+  json_add_str(obj, "asAlias", req->as_alias);
+  json_add_str(obj, "default", req->default_symbol);
+  if (req->refer_all) {
+    cJSON_AddStringToObject(obj, "refer", "all");
+  } else if (req->refer != NULL) {
+    cJSON_AddItemToObject(obj, "refer", json_symbols(req->refer));
+  }
+  if (req->exclude != NULL) {
+    cJSON_AddItemToObject(obj, "exclude", json_symbols(req->exclude));
+  }
+  if (req->has_include_macros) {
+    cJSON_AddBoolToObject(obj, "includeMacros", req->include_macros);
+  }
+  json_add_str_list(obj, "referMacros", req->refer_macros);
+  if (req->rename != NULL) {
+    cJSON_AddItemToObject(obj, "rename", json_renames(req->rename));
+  }
+  json_add_str_list(obj, "metadata", req->metadata);
+  json_add_comments(obj, req->comments_above, req->comment_after);
+  json_add_str(obj, "platform", req->platform);
+  return obj;
+}
+
+static cJSON *json_requires(const scs_ns_require_list *list) {
+  cJSON *arr = cJSON_CreateArray();
+  for (int i = 0; i < list->size; i++) {
+    cJSON_AddItemToArray(arr, json_require(&list->items[i]));
+  }
+  return arr;
+}
+
+static cJSON *json_gen_class_entry(const scs_ns_gen_class *gc, int key) {
+  const scs_gen_class_entry *entry = &gc->entries[key];
+
+  /* :implements with a value is a plain list of symbols */
+  if (key == GEN_CLASS_IMPLEMENTS && entry->has_value) {
+    return json_symbols(&gc->implements);
+  }
+
+  cJSON *obj = cJSON_CreateObject();
+  if (entry->has_value) {
+    if (is_gen_class_boolean_key(key)) {
+      cJSON_AddBoolToObject(obj, "value", entry->bool_value);
+    } else if (key == GEN_CLASS_CONSTRUCTORS) {
+      cJSON *arr = cJSON_CreateArray();
+      for (int i = 0; i < gc->constructors.size; i++) {
+        const scs_gen_class_constructor *c = &gc->constructors.items[i];
+        cJSON *itm = cJSON_CreateObject();
+        json_add_str(itm, "metadata", c->metadata);
+        cJSON_AddItemToObject(itm, "parameterTypes", json_str_list(&c->parameter_types));
+        cJSON_AddItemToObject(itm, "superParameterTypes", json_str_list(&c->super_parameter_types));
+        cJSON_AddItemToArray(arr, itm);
+      }
+      cJSON_AddItemToObject(obj, "value", arr);
+    } else if (key == GEN_CLASS_METHODS) {
+      cJSON *arr = cJSON_CreateArray();
+      for (int i = 0; i < gc->methods.size; i++) {
+        const scs_gen_class_method *m = &gc->methods.items[i];
+        cJSON *itm = cJSON_CreateObject();
+        json_add_str(itm, "metadata", m->metadata);
+        json_add_str(itm, "name", m->name);
+        cJSON_AddItemToObject(itm, "parameterTypes", json_str_list(&m->parameter_types));
+        json_add_str(itm, "returnType", m->return_type);
+        cJSON_AddItemToArray(arr, itm);
+      }
+      cJSON_AddItemToObject(obj, "value", arr);
+    } else if (key == GEN_CLASS_EXPOSES) {
+      cJSON *arr = cJSON_CreateArray();
+      for (int i = 0; i < gc->exposes.size; i++) {
+        const scs_gen_class_expose *e = &gc->exposes.items[i];
+        cJSON *itm = cJSON_CreateObject();
+        json_add_str(itm, "fieldName", e->field_name);
+        json_add_str(itm, "getter", e->getter);
+        json_add_str(itm, "setter", e->setter);
+        cJSON_AddItemToArray(arr, itm);
+      }
+      cJSON_AddItemToObject(obj, "value", arr);
+    } else if (key == GEN_CLASS_EXPOSES_METHODS) {
+      cJSON *arr = cJSON_CreateArray();
+      for (int i = 0; i < gc->exposes_methods.size; i++) {
+        const scs_gen_class_exposes_method *e = &gc->exposes_methods.items[i];
+        cJSON *itm = cJSON_CreateObject();
+        json_add_str(itm, "superMethodName", e->super_method_name);
+        json_add_str(itm, "exposedName", e->exposed_name);
+        cJSON_AddItemToArray(arr, itm);
+      }
+      cJSON_AddItemToObject(obj, "value", arr);
+    } else {
+      json_add_str(obj, "value", entry->value);
+    }
+  }
+  json_add_str(obj, "metadata", entry->metadata);
+  json_add_comments(obj, entry->comments_above, entry->comment_after);
+  return obj;
+}
+
+static cJSON *json_gen_class(const scs_ns_gen_class *gc) {
+  cJSON *obj = cJSON_CreateObject();
+  cJSON_AddBoolToObject(obj, "isEmpty", gc->is_empty);
+  json_add_str(obj, "platform", gc->platform);
+  json_add_comments(obj, gc->comments_above, gc->comment_after);
+  for (int key = 0; key < GEN_CLASS_NUM_KEYS; key++) {
+    if (gc->entries[key].present) {
+      cJSON_AddItemToObject(obj, gen_class_key_names[key], json_gen_class_entry(gc, key));
+    }
+  }
+  return obj;
+}
+
+static cJSON *ns_to_json(const scs_ns *ns) {
+  cJSON *obj = cJSON_CreateObject();
+
+  if (ns->ns_symbol.len > 0) {
+    json_add_str(obj, "nsSymbol", ns->ns_symbol);
+  } else {
+    cJSON_AddNullToObject(obj, "nsSymbol");
+  }
+  if (ns->has_docstring) {
+    cJSON_AddItemToObject(obj, "docstring", json_str(ns->docstring));
+  }
+  if (ns->ns_metadata != NULL) {
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < ns->ns_metadata->size; i++) {
+      cJSON *itm = cJSON_CreateObject();
+      json_add_str(itm, "key", ns->ns_metadata->items[i].key);
+      json_add_str(itm, "value", ns->ns_metadata->items[i].value);
+      cJSON_AddItemToArray(arr, itm);
+    }
+    cJSON_AddItemToObject(obj, "nsMetadata", arr);
+  }
+
+  if (ns->refer_clojure != NULL) {
+    cJSON *rc = cJSON_CreateObject();
+    if (ns->refer_clojure->exclude != NULL) {
+      cJSON_AddItemToObject(rc, "exclude", json_symbols(ns->refer_clojure->exclude));
+    }
+    if (ns->refer_clojure->only != NULL) {
+      cJSON_AddItemToObject(rc, "only", json_symbols(ns->refer_clojure->only));
+    }
+    if (ns->refer_clojure->rename != NULL) {
+      cJSON_AddItemToObject(rc, "rename", json_renames(ns->refer_clojure->rename));
+    }
+    cJSON_AddItemToObject(obj, "referClojure", rc);
+  }
+  json_add_str_list(obj, "referClojureCommentsAbove", ns->refer_clojure_comments_above);
+  json_add_str(obj, "referClojureCommentAfter", ns->refer_clojure_comment_after);
+
+  if (ns->require_macros != NULL) {
+    cJSON_AddItemToObject(obj, "requireMacros", json_requires(ns->require_macros));
+  }
+  json_add_str_list(obj, "requireMacrosCommentsAbove", ns->require_macros_comments_above);
+
+  if (ns->requires != NULL) {
+    cJSON_AddItemToObject(obj, "requires", json_requires(ns->requires));
+  }
+  json_add_str_list(obj, "requireCommentsAbove", ns->require_comments_above);
+  json_add_str(obj, "requireCommentAfter", ns->require_comment_after);
+
+  if (ns->imports != NULL) {
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < ns->imports->size; i++) {
+      const scs_ns_import *imp = &ns->imports->items[i];
+      cJSON *itm = cJSON_CreateObject();
+      json_add_str(itm, "package", imp->package);
+      cJSON_AddItemToObject(itm, "classes", json_str_list(&imp->classes));
+      json_add_comments(itm, imp->comments_above, imp->comment_after);
+      json_add_str(itm, "platform", imp->platform);
+      cJSON_AddItemToArray(arr, itm);
+    }
+    cJSON_AddItemToObject(obj, "imports", arr);
+  }
+  json_add_str_list(obj, "importCommentsAbove", ns->import_comments_above);
+  json_add_str(obj, "importCommentAfter", ns->import_comment_after);
+
+  if (ns->gen_class != NULL) {
+    cJSON_AddItemToObject(obj, "genClass", json_gen_class(ns->gen_class));
+  }
+  json_add_str(obj, "commentOutsideNsForm", ns->comment_outside_ns_form);
+  return obj;
+}
+
+/* parses the input and its ns form; returns NULL if parsing threw
+ * (the message is then in ctx->error_msg) */
+static scs_ns *try_parse_ns(scs_ctx *ctx, scs_str input) {
+  if (setjmp(ctx->error_jmp) == 0) {
+    scs_node *tree = parse(ctx, input);
+    scs_node_list nodes = flatten_tree(ctx, tree);
+    return parse_ns(ctx, &nodes);
+  }
+  return NULL;
 }
 
 /* -----------------------------------------------------------------------------
@@ -1924,6 +2197,231 @@ static void run_parser_test_cases(void) {
 }
 
 /* -----------------------------------------------------------------------------
+ * String Builder, Sorting, Traversal
+ */
+
+TEST(strbuf) {
+  scs_ctx *ctx = test_ctx_new();
+  scs_strbuf buf = {NULL, 0, 0};
+  ASSERT_SSTR_EQ(strbuf_to_str(&buf), "");
+  strbuf_append(ctx, &buf, STR("hello"));
+  strbuf_append(ctx, &buf, STR(""));
+  strbuf_append(ctx, &buf, STR(" world"));
+  ASSERT_SSTR_EQ(strbuf_to_str(&buf), "hello world");
+  /* growth past the initial capacity */
+  for (int i = 0; i < 100; i++) {
+    strbuf_append(ctx, &buf, STR("0123456789"));
+  }
+  ASSERT_INT_EQ(strbuf_to_str(&buf).len, 11 + 1000);
+  ASSERT_TRUE(str_starts_with(strbuf_to_str(&buf), STR("hello world0123456789")));
+  test_ctx_free(ctx);
+}
+
+TEST(str_compare) {
+  ASSERT_INT_EQ(str_compare(STR("a"), STR("a")), 0);
+  ASSERT_TRUE(str_compare(STR("a"), STR("b")) < 0);
+  ASSERT_TRUE(str_compare(STR("b"), STR("a")) > 0);
+  ASSERT_TRUE(str_compare(STR("a"), STR("ab")) < 0);
+  ASSERT_TRUE(str_compare(STR("ab"), STR("a")) > 0);
+  ASSERT_TRUE(str_compare(STR(""), STR("a")) < 0);
+  ASSERT_INT_EQ(str_compare(STR(""), STR("")), 0);
+  /* upper case sorts before lower case, as in JavaScript */
+  ASSERT_TRUE(str_compare(STR("Zebra"), STR("apple")) < 0);
+}
+
+typedef struct sort_item {
+  int key;
+  int original_position;
+} sort_item;
+
+static int compare_sort_item_keys(const void *a, const void *b) {
+  return ((const sort_item *)a)->key - ((const sort_item *)b)->key;
+}
+
+TEST(stable_sort_keeps_the_order_of_equal_items) {
+  scs_ctx *ctx = test_ctx_new();
+  sort_item items[] = {{3, 0}, {1, 1}, {2, 2}, {1, 3}, {3, 4}, {2, 5}, {1, 6}};
+  stable_sort(ctx, items, 7, sizeof(sort_item), compare_sort_item_keys);
+  int expected_positions[] = {1, 3, 6, 2, 5, 0, 4};
+  bool ok = true;
+  for (int i = 0; i < 7; i++) {
+    if (items[i].original_position != expected_positions[i]) {
+      ok = false;
+    }
+  }
+  ASSERT_TRUE(ok);
+
+  /* empty and single-item arrays */
+  sort_item one[] = {{5, 0}};
+  stable_sort(ctx, one, 1, sizeof(sort_item), compare_sort_item_keys);
+  stable_sort(ctx, one, 0, sizeof(sort_item), compare_sort_item_keys);
+  ASSERT_INT_EQ(one[0].key, 5);
+  test_ctx_free(ctx);
+}
+
+TEST(compare_symbols_then_platform) {
+  scs_ns_symbol a_clj = {STR("a"), STR(":clj")};
+  scs_ns_symbol a_cljs = {STR("a"), STR(":cljs")};
+  scs_ns_symbol a_none = {STR("a"), EMPTY_STR};
+  scs_ns_symbol b_none = {STR("b"), EMPTY_STR};
+  ASSERT_TRUE(compare_symbols_then_platform(&a_clj, &b_none) < 0);
+  ASSERT_TRUE(compare_symbols_then_platform(&b_none, &a_clj) > 0);
+  ASSERT_TRUE(compare_symbols_then_platform(&a_clj, &a_cljs) < 0);
+  ASSERT_TRUE(compare_symbols_then_platform(&a_cljs, &a_clj) > 0);
+  ASSERT_INT_EQ(compare_symbols_then_platform(&a_clj, &a_clj), 0);
+  /* a symbol without a platform compares equal to the same symbol under any platform */
+  ASSERT_INT_EQ(compare_symbols_then_platform(&a_none, &a_clj), 0);
+  ASSERT_INT_EQ(compare_symbols_then_platform(&a_clj, &a_none), 0);
+}
+
+TEST(parse_java_package_with_class) {
+  scs_ctx *ctx = test_ctx_new();
+  scs_java_package p = parse_java_package_with_class(ctx, STR("java.util.Date"));
+  ASSERT_SSTR_EQ(p.package, "java.util");
+  ASSERT_SSTR_EQ(p.class_name, "Date");
+
+  p = parse_java_package_with_class(ctx, STR("java.util"));
+  ASSERT_SSTR_EQ(p.package, "java.util");
+  ASSERT_SSTR_EQ(p.class_name, "");
+
+  p = parse_java_package_with_class(ctx, STR("Date"));
+  ASSERT_SSTR_EQ(p.package, "");
+  ASSERT_SSTR_EQ(p.class_name, "Date");
+
+  p = parse_java_package_with_class(ctx, STR("a.b.Ccc$Inner"));
+  ASSERT_SSTR_EQ(p.package, "a.b");
+  ASSERT_SSTR_EQ(p.class_name, "Ccc$Inner");
+  test_ctx_free(ctx);
+}
+
+TEST(flatten_tree_and_text_helpers) {
+  scs_ctx *ctx = test_ctx_new();
+  scs_node *tree = parse(ctx, STR("(a b)"));
+  scs_node_list nodes = flatten_tree(ctx, tree);
+  /* source, parens, .open, .body, a, whitespace, b, .close */
+  ASSERT_INT_EQ(nodes.size, 8);
+  ASSERT_TRUE(nodes.items[0] == tree);
+  ASSERT_STR_EQ(nodes.items[1]->name, "parens");
+  ASSERT_STR_EQ(nodes.items[2]->name, ".open");
+  ASSERT_SSTR_EQ(nodes.items[4]->text, "a");
+  ASSERT_STR_EQ(nodes.items[7]->name, ".close");
+
+  ASSERT_SSTR_EQ(get_text_from_root_node(ctx, tree), "(a b)");
+  ASSERT_TRUE(get_last_child_node_with_text(tree) == nodes.items[7]);
+  ASSERT_TRUE(find_next_node_with_text(&nodes, 3) == nodes.items[4]);
+  ASSERT_TRUE(find_next_non_whitespace_node(&nodes, 5) == nodes.items[6]);
+  ASSERT_NULL(find_next_node_with_text(&nodes, 8));
+
+  /* a tagged literal's text includes the # that the .tag node leaves out */
+  scs_node *tagged = parse(ctx, STR("#inst \"2020\""));
+  ASSERT_SSTR_EQ(get_text_from_root_node(ctx, tagged), "#inst \"2020\"");
+
+  /* metadata forms attached by a meta node */
+  scs_node *meta_tree = parse(ctx, STR("^:a ^{:b 1} x"));
+  scs_node *meta_node = meta_tree->children.items[0];
+  ASSERT_STR_EQ(meta_node->name, "meta");
+  scs_str_list metadata = get_metadata_strings_from_meta_node(ctx, meta_node);
+  ASSERT_INT_EQ(metadata.size, 2);
+  ASSERT_SSTR_EQ(metadata.items[0], "^:a");
+  ASSERT_SSTR_EQ(metadata.items[1], "^{:b 1}");
+  scs_node *body = get_body_node_from_meta_node(meta_node);
+  ASSERT_NOT_NULL(body);
+  ASSERT_SSTR_EQ(get_text_from_root_node(ctx, body), "x");
+  test_ctx_free(ctx);
+}
+
+TEST(parse_ns_rejects_malformed_forms_with_an_error) {
+  scs_ctx *ctx = test_ctx_new();
+  /* :as before any libspec */
+  ASSERT_NULL(try_parse_ns(ctx, STR("(ns foo (:require :as x))")));
+  ASSERT_STR_EQ(ctx->error_msg, "could not parse the ns form");
+  test_ctx_free(ctx);
+
+  ctx = test_ctx_new();
+  ASSERT_NULL(try_parse_ns(ctx, STR("(ns foo (:use bar))")));
+  ASSERT_TRUE(strstr(ctx->error_msg, ":use") != NULL);
+  test_ctx_free(ctx);
+}
+
+TEST(parse_ns_without_an_ns_form) {
+  scs_ctx *ctx = test_ctx_new();
+  scs_ns *ns = try_parse_ns(ctx, STR("(def a 1)"));
+  ASSERT_NOT_NULL(ns);
+  ASSERT_INT_EQ(ns->ns_symbol.len, 0);
+  ASSERT_NULL(ns->requires);
+  test_ctx_free(ctx);
+}
+
+/* -----------------------------------------------------------------------------
+ * parse_ns test cases (test_cases/parse_ns_tests.json)
+ */
+
+static const char *const parse_ns_cases_to_skip[] = {NULL};
+
+static void run_parse_ns_test_cases(void) {
+  test_case_list cases = read_test_cases("test_cases/parse_ns_tests.json");
+  for (int i = 0; i < cases.size; i++) {
+    test_case tc = cases.items[i];
+    char name[512];
+    snprintf(name, sizeof(name), "parse_ns: %.*s", tc.name.len, tc.name.data);
+    if (!should_run_test(name) || should_skip_case(parse_ns_cases_to_skip, tc.name)) {
+      continue;
+    }
+    start_test(name);
+
+    cJSON *expected = cJSON_ParseWithLength(tc.expected.data, (size_t)tc.expected.len);
+    assertions_run++;
+    if (expected == NULL) {
+      report_failure(__FILE__, __LINE__, "the expected structure is not valid JSON");
+      finish_test();
+      continue;
+    }
+
+    scs_ctx *ctx = test_ctx_new();
+    scs_ns *ns = try_parse_ns(ctx, tc.input);
+
+    cJSON *should_error = cJSON_GetObjectItemCaseSensitive(expected, "parsingShouldError");
+    if (cJSON_IsTrue(should_error)) {
+      cJSON *message = cJSON_GetObjectItemCaseSensitive(expected, "errorMessage");
+      assertions_run++;
+      if (ns != NULL) {
+        report_failure(__FILE__, __LINE__, "expected parse_ns to report an error");
+      } else if (!cJSON_IsString(message) || !cstr_equal(ctx->error_msg, message->valuestring)) {
+        char msg[1024];
+        snprintf(msg, sizeof(msg), "error message: expected \"%s\", got \"%s\"",
+                 cJSON_IsString(message) ? message->valuestring : "(none)",
+                 ctx->error_msg ? ctx->error_msg : "(none)");
+        report_failure(__FILE__, __LINE__, msg);
+      }
+    } else {
+      assertions_run++;
+      if (ns == NULL) {
+        char msg[1024];
+        snprintf(msg, sizeof(msg), "parse_ns unexpectedly reported an error: %s",
+                 ctx->error_msg ? ctx->error_msg : "(none)");
+        report_failure(__FILE__, __LINE__, msg);
+      } else {
+        cJSON *actual = ns_to_json(ns);
+        if (!cJSON_Compare(actual, expected, true)) {
+          report_failure(__FILE__, __LINE__, "parsed ns structure does not match");
+          char *expected_txt = cJSON_Print(expected);
+          char *actual_txt = cJSON_Print(actual);
+          report_case_mismatch(str_from_cstr(expected_txt), str_from_cstr(actual_txt));
+          cJSON_free(expected_txt);
+          cJSON_free(actual_txt);
+        }
+        cJSON_Delete(actual);
+      }
+    }
+
+    cJSON_Delete(expected);
+    test_ctx_free(ctx);
+    finish_test();
+  }
+  free_test_cases(&cases);
+}
+
+/* -----------------------------------------------------------------------------
  * Main
  */
 
@@ -2018,6 +2516,17 @@ int main(int argc, char **argv) {
   RUN_TEST(parse_limits_nesting_depth);
 
   run_parser_test_cases();
+
+  RUN_TEST(strbuf);
+  RUN_TEST(str_compare);
+  RUN_TEST(stable_sort_keeps_the_order_of_equal_items);
+  RUN_TEST(compare_symbols_then_platform);
+  RUN_TEST(parse_java_package_with_class);
+  RUN_TEST(flatten_tree_and_text_helpers);
+  RUN_TEST(parse_ns_rejects_malformed_forms_with_an_error);
+  RUN_TEST(parse_ns_without_an_ns_form);
+
+  run_parse_ns_test_cases();
 
   if (tests_run == 0) {
     printf("no tests matched \"%s\"\n", test_filter ? test_filter : "");

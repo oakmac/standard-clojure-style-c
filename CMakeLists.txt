@@ -39,9 +39,15 @@ if(SCS_BUILD_TESTS)
   enable_testing()
   # NOTE: the test binary compiles standard-clojure-style.c via #include, so it
   # is built from test/test_main.c alone (see the comment at the top of that file)
+  # cJSON (test suite only) is vendored, so it is compiled without our warning flags
+  add_library(scs_test_cjson STATIC test/cjson/cJSON.c)
   add_executable(scs_test test/test_main.c)
   target_include_directories(scs_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_compile_options(scs_test PRIVATE ${SCS_WARNINGS})
+  target_link_libraries(scs_test PRIVATE scs_test_cjson)
+  if(UNIX)
+    target_link_libraries(scs_test PRIVATE m)
+  endif()
   # the tests read test_cases/*.json relative to the repository root
   add_test(NAME scs_test COMMAND scs_test WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
