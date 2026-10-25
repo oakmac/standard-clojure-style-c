@@ -1,0 +1,10 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+> NOTE: releases of this library will skip version numbers in order to stay in sync with
+> [Standard Clojure Style JavaScript](https://github.com/oakmac/standard-clojure-style-js)
+
+## [Unreleased]
+
+- project skeleton: build files, public header, arena allocator, error handling, test runner

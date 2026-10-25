@@ -1,0 +1,13 @@
+# build output
+build/
+*.o
+*.obj
+*.a
+*.lib
+*.exe
+*.out
+*.dSYM/
+
+# editor / tooling
+compile_commands.json
+.cache/
