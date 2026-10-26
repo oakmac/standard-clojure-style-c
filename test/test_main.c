@@ -145,7 +145,7 @@ typedef struct json_reader {
   size_t pos;
 } json_reader;
 
-static void json_fail(const json_reader *r, const char *msg) {
+static SCS_NORETURN void json_fail(const json_reader *r, const char *msg) {
   fprintf(stderr, "%s: invalid test case file at byte %zu: %s\n", r->path, r->pos, msg);
   exit(1);
 }
@@ -188,7 +188,6 @@ static int json_hex_digit(json_reader *r, char c) {
     return c - 'A' + 10;
   }
   json_fail(r, "invalid hex digit in \\u escape");
-  return 0;
 }
 
 /* reads the four hex digits after \u */
