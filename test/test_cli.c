@@ -53,6 +53,44 @@ static char *project_path(const char *relative) {
   return path_resolve(project_dir, relative);
 }
 
+/* The CLI prints a file inside the project as its path with the project
+ * directory removed, so with the native separator: "/src/core.clj" here and
+ * "\src\core.clj" on Windows. The expected output in these tests is written
+ * with "/"; this maps every "/" in it to PATH_SEP. (Nothing else in those
+ * strings contains a "/".) */
+static char *native_seps(const char *s) {
+  char *copy = xstrdup(s);
+  for (char *c = copy; *c; c++) {
+    if (*c == '/') {
+      *c = PATH_SEP;
+    }
+  }
+  return copy;
+}
+
+/* like ASSERT_STR_EQ and ASSERT_CONTAINS, for expected text with file paths */
+#define ASSERT_STR_EQ_PATHS(actual, expected)                                                      \
+  do {                                                                                             \
+    char *native_ = native_seps(expected);                                                         \
+    ASSERT_STR_EQ(actual, native_);                                                                \
+    free(native_);                                                                                 \
+  } while (0)
+
+#define ASSERT_CONTAINS_PATHS(haystack, needle)                                                    \
+  do {                                                                                             \
+    char *native_ = native_seps(needle);                                                           \
+    ASSERT_CONTAINS(haystack, native_);                                                            \
+    free(native_);                                                                                 \
+  } while (0)
+
+/* s as a JSON (and EDN) string literal, the way the list command prints it;
+ * the backslashes in a Windows path come out escaped */
+static char *json_quoted(const char *s) {
+  buf b = {NULL, 0, 0};
+  append_json_string(&b, s);
+  return b.data;
+}
+
 static void write_project_file(const char *relative, const char *contents) {
   char *path = project_path(relative);
   char *dir = xstrdup(path);
@@ -1235,6 +1273,8 @@ TEST(list_output_formats) {
   create_test_project();
   char *user = project_path("dev/user.clj");
   char *core_test = project_path("test/core_test.clj");
+  char *user_json = json_quoted(user);
+  char *core_test_json = json_quoted(core_test);
 
   cli_result r = run_cli("list", "dev/user.clj", "test/core_test.clj");
   ASSERT_INT_EQ(r.exit_code, 0);
@@ -1244,25 +1284,25 @@ TEST(list_output_formats) {
   cli_result_free(&r);
 
   r = run_cli("list", "dev/user.clj", "test/core_test.clj", "--output", "json");
-  expected = xprintf("[\"%s\",\"%s\"]\n", user, core_test);
+  expected = xprintf("[%s,%s]\n", user_json, core_test_json);
   ASSERT_STR_EQ(r.out, expected);
   free(expected);
   cli_result_free(&r);
 
   r = run_cli("list", "dev/user.clj", "test/core_test.clj", "--output", "json-pretty");
-  expected = xprintf("[\n  \"%s\",\n  \"%s\"\n]\n", user, core_test);
+  expected = xprintf("[\n  %s,\n  %s\n]\n", user_json, core_test_json);
   ASSERT_STR_EQ(r.out, expected);
   free(expected);
   cli_result_free(&r);
 
   r = run_cli("list", "dev/user.clj", "test/core_test.clj", "--output", "edn");
-  expected = xprintf("[\"%s\" \"%s\"]\n", user, core_test);
+  expected = xprintf("[%s %s]\n", user_json, core_test_json);
   ASSERT_STR_EQ(r.out, expected);
   free(expected);
   cli_result_free(&r);
 
   r = run_cli("list", "dev/user.clj", "test/core_test.clj", "--output", "edn-pretty");
-  expected = xprintf("[\"%s\"\n \"%s\"]\n", user, core_test);
+  expected = xprintf("[%s\n %s]\n", user_json, core_test_json);
   ASSERT_STR_EQ(r.out, expected);
   free(expected);
   cli_result_free(&r);
@@ -1278,6 +1318,8 @@ TEST(list_output_formats) {
 
   free(user);
   free(core_test);
+  free(user_json);
+  free(core_test_json);
 }
 
 /* -----------------------------------------------------------------------------
@@ -1289,14 +1331,14 @@ TEST(check_all_formatted) {
   cli_result r = run_cli("check", "dev", "test");
   ASSERT_INT_EQ(r.exit_code, 0);
   ASSERT_STR_EQ(r.err, "");
-  ASSERT_STR_EQ(r.out,
-                "standard-clj check 0.0.0-test\n"
-                "\n"
-                "\xE2\x9C\x93 /dev/user.clj [0ms]\n"
-                "\xE2\x9C\x93 /test/core_test.clj [0ms]\n"
-                "\xE2\x9C\x93 /test/nested/browser_test.cljs [0ms]\n"
-                "\n"
-                "All 3 files formatted with Standard Clojure Style \xF0\x9F\x91\x8D [0ms]\n");
+  ASSERT_STR_EQ_PATHS(r.out,
+                      "standard-clj check 0.0.0-test\n"
+                      "\n"
+                      "\xE2\x9C\x93 /dev/user.clj [0ms]\n"
+                      "\xE2\x9C\x93 /test/core_test.clj [0ms]\n"
+                      "\xE2\x9C\x93 /test/nested/browser_test.cljs [0ms]\n"
+                      "\n"
+                      "All 3 files formatted with Standard Clojure Style \xF0\x9F\x91\x8D [0ms]\n");
   cli_result_free(&r);
 
   r = run_cli("check", "dev/user.clj");
@@ -1318,17 +1360,17 @@ TEST(check_reports_files_that_need_formatting_and_errors) {
                                "appropriate.\n"
                                "\xE2\x9C\x97 /src/messy.clj [0ms]\n",
                                broken);
-  ASSERT_STR_EQ(r.err, expected_err);
+  ASSERT_STR_EQ_PATHS(r.err, expected_err);
   free(expected_err);
   free(broken);
 
-  ASSERT_STR_EQ(r.out, "standard-clj check 0.0.0-test\n"
-                       "\n"
-                       "\xE2\x9C\x93 /src/core.clj [0ms]\n"
-                       "\n"
-                       "1 file formatted with Standard Clojure Style\n"
-                       "1 file require formatting\n"
-                       "Checked 3 files. [0ms]\n");
+  ASSERT_STR_EQ_PATHS(r.out, "standard-clj check 0.0.0-test\n"
+                             "\n"
+                             "\xE2\x9C\x93 /src/core.clj [0ms]\n"
+                             "\n"
+                             "1 file formatted with Standard Clojure Style\n"
+                             "1 file require formatting\n"
+                             "Checked 3 files. [0ms]\n");
   cli_result_free(&r);
 
   /* the files were not modified */
@@ -1344,16 +1386,17 @@ TEST(fix_formats_files_in_place) {
   write_project_file("src/broken.clj", "(ns broken (:use something))\n");
   cli_result r = run_cli("fix", "src/core.clj", "src/messy.clj", "src/broken.clj");
   ASSERT_INT_EQ(r.exit_code, 1);
-  ASSERT_STR_EQ(r.err, "E /src/broken.clj - Standard Clojure Style does not support :use inside "
-                       "of the ns form. Please refactor with :require as appropriate. [0ms]\n");
-  ASSERT_STR_EQ(r.out, "standard-clj fix 0.0.0-test\n"
-                       "\n"
-                       "\xE2\x9C\x93 /src/core.clj [0ms]\n"
-                       "F /src/messy.clj [0ms]\n"
-                       "\n"
-                       "2 files formatted with Standard Clojure Style\n"
-                       "1 files with errors\n"
-                       "Checked 3 files. [0ms]\n");
+  ASSERT_STR_EQ_PATHS(r.err,
+                      "E /src/broken.clj - Standard Clojure Style does not support :use inside "
+                      "of the ns form. Please refactor with :require as appropriate. [0ms]\n");
+  ASSERT_STR_EQ_PATHS(r.out, "standard-clj fix 0.0.0-test\n"
+                             "\n"
+                             "\xE2\x9C\x93 /src/core.clj [0ms]\n"
+                             "F /src/messy.clj [0ms]\n"
+                             "\n"
+                             "2 files formatted with Standard Clojure Style\n"
+                             "1 files with errors\n"
+                             "Checked 3 files. [0ms]\n");
   cli_result_free(&r);
 
   char *messy = read_project_file("src/messy.clj");
@@ -1385,7 +1428,7 @@ TEST(log_levels) {
   r = run_cli("check", "src/core.clj", "src/messy.clj", "-l", "ignore-already-formatted");
   ASSERT_INT_EQ(r.exit_code, 1);
   ASSERT_NOT_CONTAINS(r.out, "\xE2\x9C\x93");
-  ASSERT_CONTAINS(r.err, "\xE2\x9C\x97 /src/messy.clj");
+  ASSERT_CONTAINS_PATHS(r.err, "\xE2\x9C\x97 /src/messy.clj");
   cli_result_free(&r);
 
   /* the numeric aliases */
@@ -1446,15 +1489,15 @@ TEST(colors) {
   write_project_file("src/messy.clj", "(def x\n1)\n");
   cli_result r = run_cli_colors("check", "src/core.clj", "src/messy.clj");
   ASSERT_INT_EQ(r.exit_code, 1);
-  ASSERT_STR_EQ(r.out,
-                "\x1b[1mstandard-clj check\x1b[22m \x1b[2m0.0.0-test\x1b[22m\n"
-                "\n"
-                "\x1b[32m\xE2\x9C\x93\x1b[39m \x1b[1m/src/core.clj\x1b[22m \x1b[2m[0ms]\x1b[22m\n"
-                "\n"
-                "\x1b[32m1 file formatted with Standard Clojure Style\x1b[39m\n"
-                "\x1b[31m1 file require formatting\x1b[39m\n"
-                "Checked 2 files. \x1b[2m[0ms]\x1b[22m\n");
-  ASSERT_STR_EQ(
+  ASSERT_STR_EQ_PATHS(
+      r.out, "\x1b[1mstandard-clj check\x1b[22m \x1b[2m0.0.0-test\x1b[22m\n"
+             "\n"
+             "\x1b[32m\xE2\x9C\x93\x1b[39m \x1b[1m/src/core.clj\x1b[22m \x1b[2m[0ms]\x1b[22m\n"
+             "\n"
+             "\x1b[32m1 file formatted with Standard Clojure Style\x1b[39m\n"
+             "\x1b[31m1 file require formatting\x1b[39m\n"
+             "Checked 2 files. \x1b[2m[0ms]\x1b[22m\n");
+  ASSERT_STR_EQ_PATHS(
       r.err, "\x1b[31m\xE2\x9C\x97\x1b[39m \x1b[1m/src/messy.clj\x1b[22m \x1b[2m[0ms]\x1b[22m\n");
   cli_result_free(&r);
 
@@ -1465,7 +1508,8 @@ TEST(colors) {
   cli_result_free(&r);
   write_project_file("src/broken.clj", "(ns broken (:use x))\n");
   r = run_cli_colors("fix", "src/broken.clj");
-  ASSERT_CONTAINS(r.err, "\x1b[31mE\x1b[39m \x1b[1m\x1b[31m/src/broken.clj\x1b[39m\x1b[22m - ");
+  ASSERT_CONTAINS_PATHS(r.err,
+                        "\x1b[31mE\x1b[39m \x1b[1m\x1b[31m/src/broken.clj\x1b[39m\x1b[22m - ");
   cli_result_free(&r);
 }
 
