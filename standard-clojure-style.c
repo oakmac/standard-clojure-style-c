@@ -1428,6 +1428,15 @@ static int match_wrap_marker(scs_str txt, int pos) {
 #define SCS_MAX_NESTING_DEPTH 500
 #endif
 
+/* The grammar is recursive, so p_gap and p_form are declared here (as C
+ * tentative definitions) and defined after the parsers that refer to them.
+ * MSVC warns that a const object "should be initialized" (C4132) for a
+ * tentative definition even though C permits it; silence that warning until
+ * the definitions below. */
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4132)
+#endif
 static const scs_parser p_gap;
 static const scs_parser p_form;
 
@@ -1651,6 +1660,10 @@ static scs_node *parse_form(scs_ctx *ctx, const scs_parser *p, scs_str txt, int 
 }
 
 static const scs_parser p_form = {.parse = parse_form, .name = NULL};
+
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 /* source: gaps and forms until the end of the input; anything else is an error node */
 static const scs_parser p_source_error = {.parse = parse_any_char, .name = "error"};

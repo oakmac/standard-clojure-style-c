@@ -23,6 +23,11 @@ option(SCS_BUILD_TESTS "Build the test suite" ON)
 # Strict warnings, and every warning is an error.
 if(MSVC)
   set(SCS_WARNINGS /W4 /WX)
+  # C4204 is MSVC's warning that initializing a struct with values that are not
+  # constants is a "nonstandard extension"; it is standard C99, which we use.
+  list(APPEND SCS_WARNINGS /wd4204)
+  # fopen(), getenv() and friends are not "unsafe" in the way we use them
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 else()
   set(SCS_WARNINGS -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wstrict-prototypes
                    -Wmissing-prototypes -Werror)

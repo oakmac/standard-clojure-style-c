@@ -39,6 +39,9 @@
 #include <time.h>
 
 #ifdef _WIN32
+/* keep <windows.h> from defining min/max and a pile of other short macros */
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <direct.h>
 #include <fcntl.h>
 #include <io.h>
@@ -105,14 +108,15 @@ static char *xstrdup(const char *s) {
 static char *vxprintf(const char *fmt, va_list args) {
   va_list args2;
   va_copy(args2, args);
-  char small[256];
-  int needed = vsnprintf(small, sizeof(small), fmt, args);
+  /* NOTE: not named "small"; <windows.h> defines that as a macro for char */
+  char stack_buf[256];
+  int needed = vsnprintf(stack_buf, sizeof(stack_buf), fmt, args);
   if (needed < 0) {
     needed = 0;
   }
   char *s = xmalloc((size_t)needed + 1);
-  if ((size_t)needed < sizeof(small)) {
-    memcpy(s, small, (size_t)needed + 1);
+  if ((size_t)needed < sizeof(stack_buf)) {
+    memcpy(s, stack_buf, (size_t)needed + 1);
   } else {
     vsnprintf(s, (size_t)needed + 1, fmt, args2);
   }
