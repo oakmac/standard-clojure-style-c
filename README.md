@@ -127,8 +127,20 @@ make test-asan
 make format
 make format-check
 
-# run only the tests whose name contains some text
+```
+
+The test programs take a filter and a quiet flag (`./build/test` is the library suite, `./build/test-cli`
+the CLI suite):
+
+```sh
+# run a single test case
 ./build/test "parser: Simple Map"
+
+# run a single suite
+./build/test Arena
+
+# print nothing unless a test fails (the exit code is still 0 or 1)
+./build/test --quiet
 ```
 
 The tests read the fixture files in `test_cases/` relative to the current directory, so run them from
