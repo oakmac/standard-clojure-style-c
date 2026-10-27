@@ -11,6 +11,11 @@
  * Build and run with `make test` (or via CMake, see README.md).
  */
 
+/* for isatty() and fileno(), used by framework.h */
+#if !defined(_WIN32)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "../standard-clojure-style.c"
 
 #include "../vendor/cjson/cJSON.h"
@@ -2135,6 +2140,7 @@ static bool should_skip_case(const char *const *skip_list, scs_str name) {
 }
 
 static void run_parser_test_cases(void) {
+  SUITE("test_cases/parser_tests.json");
   test_case_list cases = read_test_cases("test_cases/parser_tests.json");
   for (int i = 0; i < cases.size; i++) {
     test_case tc = cases.items[i];
@@ -2327,6 +2333,7 @@ TEST(parse_ns_without_an_ns_form) {
 static const char *const parse_ns_cases_to_skip[] = {NULL};
 
 static void run_parse_ns_test_cases(void) {
+  SUITE("test_cases/parse_ns_tests.json");
   test_case_list cases = read_test_cases("test_cases/parse_ns_tests.json");
   for (int i = 0; i < cases.size; i++) {
     test_case tc = cases.items[i];
@@ -2398,6 +2405,7 @@ static const char *const format_cases_to_skip[] = {"Surrounding newlines removed
                                                    "ambiguous import comment", NULL};
 
 static void run_format_test_cases(void) {
+  SUITE("test_cases/format_tests.json");
   test_case_list cases = read_test_cases("test_cases/format_tests.json");
   for (int i = 0; i < cases.size; i++) {
     test_case tc = cases.items[i];
@@ -2539,10 +2547,9 @@ TEST(robustness_truncated_test_case_inputs) {
 /* usage: test [name-filter]
  * With a filter, only tests whose name contains the given text are run. */
 int main(int argc, char **argv) {
-  if (argc > 1) {
-    test_filter = argv[1];
-  }
+  TEST_BEGIN(argc, argv);
 
+  SUITE("Public API");
   RUN_TEST(version_is_exposed);
   RUN_TEST(format_formats_code);
   RUN_TEST(format_does_not_require_a_nul_terminated_input);
@@ -2554,6 +2561,7 @@ int main(int argc, char **argv) {
   RUN_TEST(format_rejects_null_input);
   RUN_TEST(format_result_free_accepts_null);
 
+  SUITE("Arena");
   RUN_TEST(arena_alloc_returns_zeroed_aligned_memory);
   RUN_TEST(arena_zero_size_allocation_returns_unique_pointer);
   RUN_TEST(arena_grows_across_blocks_without_overlap);
@@ -2561,6 +2569,7 @@ int main(int argc, char **argv) {
   RUN_TEST(arena_rejects_sizes_that_would_overflow);
   RUN_TEST(arena_can_be_reused_after_free_all);
 
+  SUITE("String Util");
   RUN_TEST(str_basics);
   RUN_TEST(char_at);
   RUN_TEST(substr);
@@ -2582,17 +2591,20 @@ int main(int argc, char **argv) {
   RUN_TEST(str_concat);
   RUN_TEST(str_split);
 
+  SUITE("String Util - Unicode");
   RUN_TEST(unicode_str_len);
   RUN_TEST(unicode_char_at);
   RUN_TEST(unicode_substr);
   RUN_TEST(unicode_malformed_input_is_passed_through);
 
+  SUITE("Stack Operations");
   RUN_TEST(node_list_peek);
   RUN_TEST(node_list_pop);
   RUN_TEST(node_list_push_grows);
   RUN_TEST(node_list_integration);
   RUN_TEST(str_list_operations);
 
+  SUITE("Format Helpers");
   RUN_TEST(comment_needs_space_before);
   RUN_TEST(comment_needs_space_inside);
   RUN_TEST(remove_leading_whitespace);
@@ -2603,6 +2615,7 @@ int main(int argc, char **argv) {
   RUN_TEST(is_newline_node_with_comma_on_next_line);
   RUN_TEST(newline_and_whitespace_node_predicates);
 
+  SUITE("Parsers");
   RUN_TEST(named_parser_basic);
   RUN_TEST(named_parser_with_existing_name);
   RUN_TEST(named_parser_with_unnamed_parser);
@@ -2618,6 +2631,7 @@ int main(int argc, char **argv) {
   RUN_TEST(repeat_parser);
   RUN_TEST(choice_parser);
 
+  SUITE("Text Matchers");
   RUN_TEST(match_token);
   RUN_TEST(match_whitespace);
   RUN_TEST(match_comment);
@@ -2625,6 +2639,7 @@ int main(int argc, char **argv) {
   RUN_TEST(match_namespaced_map_open);
   RUN_TEST(match_openers_and_markers);
 
+  SUITE("Parse");
   RUN_TEST(parse_empty_input);
   RUN_TEST(parse_assigns_unique_ids);
   RUN_TEST(parse_node_indexes_are_code_points);
@@ -2632,6 +2647,7 @@ int main(int argc, char **argv) {
 
   run_parser_test_cases();
 
+  SUITE("String Builder, Sorting, Traversal");
   RUN_TEST(strbuf);
   RUN_TEST(str_compare);
   RUN_TEST(stable_sort_keeps_the_order_of_equal_items);
@@ -2645,6 +2661,7 @@ int main(int argc, char **argv) {
 
   run_format_test_cases();
 
+  SUITE("Robustness");
   RUN_TEST(robustness_random_clojure_like_input);
   RUN_TEST(robustness_mutated_test_case_inputs);
   RUN_TEST(robustness_truncated_test_case_inputs);

@@ -1196,6 +1196,7 @@ static const discovery_case discovery_cases[] = {
 };
 
 static void run_discovery_cases(void) {
+  SUITE("File discovery");
   size_t num_cases = sizeof(discovery_cases) / sizeof(discovery_cases[0]);
   for (size_t i = 0; i < num_cases; i++) {
     const discovery_case *tc = &discovery_cases[i];
@@ -1606,9 +1607,7 @@ TEST(config_file_errors) {
  */
 
 int main(int argc, char **argv) {
-  if (argc > 1) {
-    test_filter = argv[1];
-  }
+  TEST_BEGIN(argc, argv);
 
   char *cwd = current_directory();
   if (cwd == NULL) {
@@ -1619,6 +1618,7 @@ int main(int argc, char **argv) {
   streams_dir = path_resolve(cwd, "build/cli-test-streams");
   free(cwd);
 
+  SUITE("Pure helpers");
   RUN_TEST(normalize_log_level);
   RUN_TEST(classify_format_result);
   RUN_TEST(file_str_and_add_period_prefix);
@@ -1635,8 +1635,11 @@ int main(int argc, char **argv) {
   run_discovery_cases();
   RUN_TEST(warns_when_a_direct_argument_does_not_exist);
   RUN_TEST(warns_when_a_literal_ignore_path_does_not_exist);
+
+  SUITE("List output formats");
   RUN_TEST(list_output_formats);
 
+  SUITE("Check and fix");
   RUN_TEST(check_all_formatted);
   RUN_TEST(check_reports_files_that_need_formatting_and_errors);
   RUN_TEST(fix_formats_files_in_place);
@@ -1645,6 +1648,7 @@ int main(int argc, char **argv) {
   RUN_TEST(fix_from_stdin);
   RUN_TEST(colors);
 
+  SUITE("Help, version, usage errors, config errors");
   RUN_TEST(help_and_version);
   RUN_TEST(usage_errors);
   RUN_TEST(config_file_errors);
